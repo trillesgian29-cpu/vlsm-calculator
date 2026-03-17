@@ -290,7 +290,7 @@ R1 (Serial0/1/0) OUT ─────────── IN (Serial0/1/1) R2
 
 ## 👨‍💻 Author
 
-Built as a practical networking tool for Computer Engineering and Computer Networks students.
+Gian Carlo Trilles
 
 ---
 

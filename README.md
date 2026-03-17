@@ -267,7 +267,7 @@ For routers with multiple serial links (ring topology):
 
 ## Example 
 
- ![PortConnection](docs/screenshots/4_port_connection_map(1).png)
+ ![PortConnection](docs/screenshots/4_port_conection_map(1).png)
  
  ![PortConnection](docs/screenshots/5_port_connection_map(2).png)
 

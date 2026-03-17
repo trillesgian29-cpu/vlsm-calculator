@@ -1,6 +1,5 @@
 # docs/screenshots/
 
-Place application screenshots here for use in the README.
 
 Recommended screenshots:
 - `preview.png`   — Main application view (used in README header)

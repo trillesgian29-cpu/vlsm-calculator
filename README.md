@@ -62,7 +62,7 @@ The tool supports **Static Routing**, **RIP v2**, **OSPF**, and **EIGRP** protoc
 ---
 
 ### Input Panel — Host Boxes and Topology Selector
-![Input Panel](docs/screenshots/1_preview.png)
+![Input Panel](docs/screenshots/3_dynamic_Or_static.png)
 
 > Enter your base network IP, add one host box per router, then select Bus/Linear or Ring topology. The WAN link preview updates automatically.
 
@@ -77,13 +77,14 @@ The tool supports **Static Routing**, **RIP v2**, **OSPF**, and **EIGRP** protoc
 
 ### CLI Terminal Output
 ![CLI Terminal](docs/screenshots/6_CLI(1).png)
+![CLI Terminal](docs/screenshots/7_CLI(2).png)
 
 > Each router gets a Stage 1 (interface config) and Stage 2 (routing protocol) block. A Connection Map at the top shows the exact port and IP assignment for every link.
 
 ---
 
 ### Topology Selector
-![Topology Selector](docs/screenshots/3_dynamic_OR_static.png)
+![Topology Selector](docs/screenshots/1_preview.png)
 
 > Choose Bus/Linear (chain, N−1 WAN links) or Ring (closed loop, N WAN links). The system dynamically previews the WAN links that will be generated before you calculate.
 

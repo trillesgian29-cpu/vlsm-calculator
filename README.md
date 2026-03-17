@@ -1,6 +1,6 @@
-# VLSM Calculator with Routing Configuration Generator
+# 🧮 VLSM Calculator with Routing Configuration Generator
 
-![VLSM Calculator](docs/screenshots/preview.png)
+![VLSM Calculator](docs/screenshots)
 
 > A fully offline, browser-based VLSM (Variable Length Subnet Masking) calculator that automatically generates complete Cisco IOS router configurations — ready to paste directly into Packet Tracer or a real Cisco router.
 

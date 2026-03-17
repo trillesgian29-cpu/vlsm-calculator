@@ -265,15 +265,9 @@ For routers with multiple serial links (ring topology):
 - ✔ `firstIP` of every `/30` always assigned to the OUT router
 - ✔ `lastIP` of every `/30` always assigned to the IN router
 
-### Example — R1 → R2 using network 172.169.2.0/30
-
-```
-R1 (Serial0/1/0) OUT ─────────── IN (Serial0/1/1) R2
-  /30 Network : 172.169.2.0/30  (255.255.255.252)
-  OUT IP      : 172.169.2.1  → R1 Serial0/1/0
-  IN  IP      : 172.169.2.2  → R2 Serial0/1/1
-```
-
+### Example 
+![PortConnection](docs/screenshots/4_port_connection_map(1).png)
+![PortConnection](docs/screenshots/5_port_connection_map(2).png)
 ---
 
 ## 🔮 Future Improvements

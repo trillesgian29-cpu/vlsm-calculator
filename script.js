@@ -216,6 +216,67 @@ function updateWanPreview() {
 }
 
 /* ============================================================
+   5a. WAN START ADDRESS HELPER
+   ============================================================
+   Computes a safe start address for all WAN /30 blocks so they
+   stay INSIDE the same major classful network as the base IP.
+
+   Strategy:
+     1. Find the LAST address of the major network (class boundary)
+     2. Step back enough /30 blocks for all WAN links
+     3. Align to a /30 boundary (multiple of 4)
+
+   Example — base 172.168.0.0 (Class B → major = 172.168.0.0/16):
+     Last address of class: 172.168.255.255
+     For 4 WAN links (16 addresses): start at 172.168.255.240
+     Aligned /30 blocks: .240, .244, .248, .252
+
+   This guarantees:
+     ✔ ALL WAN /30s are in the same major network as LAN subnets
+     ✔ RIP only needs ONE network statement
+     ✔ No discontiguous network issues
+   ============================================================ */
+
+/**
+ * Returns the integer start address for WAN /30 allocation.
+ * Placed near the END of the major network so it never overlaps
+ * with LAN subnets growing from the start.
+ *
+ * @param {string} baseIp    - user-entered base network IP
+ * @param {number} wanCount  - number of /30 WAN links needed
+ * @returns {number} - integer IP of first WAN /30 network address
+ */
+function getWanStartAddress(baseIp, wanCount) {
+  const baseInt  = ipToInt(baseIp);
+  const firstOct = (baseInt >>> 24) & 255;
+  const secOct   = (baseInt >>> 16) & 255;
+  const thirdOct = (baseInt >>>  8) & 255;
+
+  // Determine last address of the major classful network
+  let majorLastInt;
+  if (firstOct >= 1 && firstOct <= 126) {
+    // Class A — x.0.0.0/8 — last address x.255.255.255
+    majorLastInt = ((firstOct << 24) | 0x00FFFFFF) >>> 0;
+  } else if (firstOct >= 128 && firstOct <= 191) {
+    // Class B — x.y.0.0/16 — last address x.y.255.255
+    majorLastInt = ((firstOct << 24) | (secOct << 16) | 0x0000FFFF) >>> 0;
+  } else {
+    // Class C — x.y.z.0/24 — last address x.y.z.255
+    majorLastInt = ((firstOct << 24) | (secOct << 16) | (thirdOct << 8) | 0xFF) >>> 0;
+  }
+
+  // Each /30 block = 4 addresses. Total space needed:
+  const totalNeeded = wanCount * 4;
+
+  // Start address = last address of major network minus total needed,
+  // then aligned DOWN to nearest /30 boundary (multiple of 4)
+  let wanStart = (majorLastInt - totalNeeded + 1) >>> 0;
+  wanStart     = (wanStart & ~3) >>> 0;  // align to /30 boundary
+
+  return wanStart;
+}
+
+/* ============================================================
    5. CORE VLSM CALCULATION
    ============================================================ */
 
@@ -285,19 +346,31 @@ function calculate() {
   lanSubnets.sort((a, b) => a.routerIdx - b.routerIdx);
 
   // ── WAN /30 allocation ─────────────────────────────────
+  // CRITICAL RIP FIX: All WAN /30 subnets MUST stay inside the
+  // SAME major classful network as the base IP.
+  //
+  // Problem: if LAN subnets grow past e.g. 172.168.255.x, the next
+  // sequential cursor becomes 172.169.0.0 — a DIFFERENT Class B.
+  // RIP would then see two major networks → discontiguous → broken.
+  //
+  // Solution: place WAN /30 blocks at a known safe address near the
+  // END of the major network, working backwards from the last /30-
+  // aligned address inside the same class boundary.
+  const wanStart = getWanStartAddress(baseStr, wanLinks.length);
+  let wanCursor  = wanStart;
+
   for (let i = 0; i < wanLinks.length; i++) {
     const wl       = wanLinks[i];
-    const netInt   = cursor >>> 0;
+    const netInt   = wanCursor >>> 0;
     const bcastInt = (netInt + 4 - 1) >>> 0;
-    // firstIP = OUT side ip,  lastIP = IN side ip
     const firstInt = (netInt + 1) >>> 0;
     const lastInt  = (bcastInt - 1) >>> 0;
 
     const sub = {
       type:      'wan',
       label:     `${wl.label} Link`,
-      r0idx:     wl.r0,    // OUT router index (0-based)
-      r1idx:     wl.r1,    // IN  router index (0-based)
+      r0idx:     wl.r0,
+      r1idx:     wl.r1,
       hostsReq:  2,
       cidr:      30,
       usable:    2,
@@ -306,9 +379,9 @@ function calculate() {
       netAddr:   intToIp(netInt),
       netInt,
       mask:      CIDR_30.mask,
-      firstIP:   intToIp(firstInt),   // → OUT (S0/x/0)
+      firstIP:   intToIp(firstInt),
       firstInt,
-      lastIP:    intToIp(lastInt),    // → IN  (S0/x/1)
+      lastIP:    intToIp(lastInt),
       lastInt,
       broadcast: intToIp(bcastInt),
       bcastInt,
@@ -316,10 +389,10 @@ function calculate() {
     };
     vlsmData.push(sub);
     serialSubnets.push(sub);
-    cursor = (bcastInt + 1) >>> 0;
+    wanCursor = (bcastInt + 1) >>> 0;
   }
 
-  renderTable(cursor);
+  renderTable(cursor, wanCursor);
 
   document.getElementById('tableCard').classList.remove('hidden');
   document.getElementById('routingCard').classList.remove('hidden');
@@ -356,7 +429,7 @@ function showError(msg) {
    6. TABLE RENDERER
    ============================================================ */
 
-function renderTable(nextFreeInt) {
+function renderTable(nextFreeInt, wanNextInt) {
   const body = document.getElementById('vlsmBody');
   body.innerHTML = '';
   let rowNum = 0;
@@ -417,7 +490,8 @@ function renderTable(nextFreeInt) {
     <div class="s-chip"><span class="s-chip-label">WAN /30 Links</span> <span class="s-chip-val">${serialSubnets.length}</span></div>
     <div class="s-chip"><span class="s-chip-label">Topology</span>      <span class="s-chip-val">${topoLabel}</span></div>
     <div class="s-chip"><span class="s-chip-label">Total Hosts</span>   <span class="s-chip-val">${totalHosts.toLocaleString()}</span></div>
-    <div class="s-chip"><span class="s-chip-label">Next Free IP</span>  <span class="s-chip-val">${intToIp(nextFreeInt)}</span></div>
+    <div class="s-chip"><span class="s-chip-label">Next Free (LAN)</span>  <span class="s-chip-val">${intToIp(nextFreeInt)}</span></div>
+    <div class="s-chip"><span class="s-chip-label">Same Major Network</span>  <span class="s-chip-val">${getMajorNetwork(intToIp(nextFreeInt))}</span></div>
   `;
 }
 

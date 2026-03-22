@@ -56,36 +56,22 @@ The tool supports **Static Routing**, **RIP v2**, **OSPF**, and **EIGRP** protoc
 
 ## 📸 Screenshots
 
-### Main Application View
-![Main Application View](docs/screenshots/1_preview.png)
+> _Screenshots will be added after first deployment._
 
----
+**Input Panel**
+```
+docs/screenshots/input.png
+```
 
-### Input Panel — Host Boxes and Topology Selector
-![Input Panel](docs/screenshots/1_preview.png)
+**VLSM Routing Table**
+```
+docs/screenshots/table.png
+```
 
-> Enter your base network IP, add one host box per router, then select Bus/Linear or Ring topology. The WAN link preview updates automatically.
-
----
-
-### VLSM Routing Table
-![VLSM Routing Table](docs/screenshots/2_table.png)
-
-> LAN subnets appear in blue rows. Auto-generated WAN /30 links appear in yellow rows, annotated with OUT and IN IPs and the assigned serial interface.
-
----
-
-### CLI Terminal Output
-![CLI Terminal](docs/screenshots/6_CLI(1).png)
-
-> Each router gets a Stage 1 (interface config) and Stage 2 (routing protocol) block. A Connection Map at the top shows the exact port and IP assignment for every link.
-
----
-
-### Topology Selector
-![Topology Selector](docs/screenshots/3_dynamic_OR_static.png)
-
-> Choose Bus/Linear (chain, N−1 WAN links) or Ring (closed loop, N WAN links). The system dynamically previews the WAN links that will be generated before you calculate.
+**CLI Output Terminal**
+```
+docs/screenshots/cli.png
+```
 
 ---
 
@@ -236,9 +222,8 @@ For routers not directly adjacent to a destination network, the system uses **Br
 All generated CLI strictly follows Cisco IOS syntax:
 - No leading spaces before commands
 - Starts with `enable` + `configure terminal`
-- `!` comment lines label each interface block (valid IOS syntax)
-- Ends with `exit` from mode + `end`
-- No HTML, no browser formatting artifacts
+- Ends with `exit` (from mode) + `end`
+- No HTML, no browser artifacts
 
 ---
 
@@ -264,16 +249,12 @@ For routers with multiple serial links (ring topology):
 - ✔ `firstIP` of every `/30` always assigned to the OUT router
 - ✔ `lastIP` of every `/30` always assigned to the IN router
 
-### Example — R1 → R2 using network 172.169.2.0/30
+## Example 
 
-```
-R1 (Serial0/1/0) OUT ─────────── IN (Serial0/1/1) R2
-  /30 Network : 172.169.2.0/30  (255.255.255.252)
-  OUT IP      : 172.169.2.1  → R1 Serial0/1/0
-  IN  IP      : 172.169.2.2  → R2 Serial0/1/1
-```
+ ![PortConnection](docs/screenshots/4_port_conection_map(1).png)
+ 
+ ![PortConnection](docs/screenshots/5_port_connection_map(2).png)
 
----
 
 ## 🔮 Future Improvements
 
@@ -290,7 +271,7 @@ R1 (Serial0/1/0) OUT ─────────── IN (Serial0/1/1) R2
 
 ## 👨‍💻 Author
 
-Built as a practical networking tool for Computer Engineering and Computer Networks students.
+Built as a practical networking tool for Computer Engineering students.
 
 ---
 

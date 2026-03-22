@@ -216,68 +216,21 @@ function updateWanPreview() {
 }
 
 /* ============================================================
-   5a. WAN START ADDRESS HELPER
-   ============================================================
-   Computes a safe start address for all WAN /30 blocks so they
-   stay INSIDE the same major classful network as the base IP.
-
-   Strategy:
-     1. Find the LAST address of the major network (class boundary)
-     2. Step back enough /30 blocks for all WAN links
-     3. Align to a /30 boundary (multiple of 4)
-
-   Example — base 172.168.0.0 (Class B → major = 172.168.0.0/16):
-     Last address of class: 172.168.255.255
-     For 4 WAN links (16 addresses): start at 172.168.255.240
-     Aligned /30 blocks: .240, .244, .248, .252
-
-   This guarantees:
-     ✔ ALL WAN /30s are in the same major network as LAN subnets
-     ✔ RIP only needs ONE network statement
-     ✔ No discontiguous network issues
-   ============================================================ */
-
-/**
- * Returns the integer start address for WAN /30 allocation.
- * Placed near the END of the major network so it never overlaps
- * with LAN subnets growing from the start.
- *
- * @param {string} baseIp    - user-entered base network IP
- * @param {number} wanCount  - number of /30 WAN links needed
- * @returns {number} - integer IP of first WAN /30 network address
- */
-function getWanStartAddress(baseIp, wanCount) {
-  const baseInt  = ipToInt(baseIp);
-  const firstOct = (baseInt >>> 24) & 255;
-  const secOct   = (baseInt >>> 16) & 255;
-  const thirdOct = (baseInt >>>  8) & 255;
-
-  // Determine last address of the major classful network
-  let majorLastInt;
-  if (firstOct >= 1 && firstOct <= 126) {
-    // Class A — x.0.0.0/8 — last address x.255.255.255
-    majorLastInt = ((firstOct << 24) | 0x00FFFFFF) >>> 0;
-  } else if (firstOct >= 128 && firstOct <= 191) {
-    // Class B — x.y.0.0/16 — last address x.y.255.255
-    majorLastInt = ((firstOct << 24) | (secOct << 16) | 0x0000FFFF) >>> 0;
-  } else {
-    // Class C — x.y.z.0/24 — last address x.y.z.255
-    majorLastInt = ((firstOct << 24) | (secOct << 16) | (thirdOct << 8) | 0xFF) >>> 0;
-  }
-
-  // Each /30 block = 4 addresses. Total space needed:
-  const totalNeeded = wanCount * 4;
-
-  // Start address = last address of major network minus total needed,
-  // then aligned DOWN to nearest /30 boundary (multiple of 4)
-  let wanStart = (majorLastInt - totalNeeded + 1) >>> 0;
-  wanStart     = (wanStart & ~3) >>> 0;  // align to /30 boundary
-
-  return wanStart;
-}
-
-/* ============================================================
    5. CORE VLSM CALCULATION
+   ============================================================
+   KEY DESIGN DECISIONS:
+   ─────────────────────
+   1. LAN subnets allocate sequentially from base IP (largest first)
+   2. WAN /30 subnets are placed at the END of the major network
+      → This keeps ALL subnets in the SAME classful network
+      → Required for RIP to work with a single network statement
+   3. Before allocating, we validate total space needed vs available
+   4. If LAN subnets would overlap with WAN reserved space → error
+
+   Supported base networks: ANY valid IPv4 classful address
+     Class A: 1.x.x.x – 126.x.x.x  (large, up to /8)
+     Class B: 128.x.x.x – 191.x.x.x (medium, up to /16)
+     Class C: 192.x.x.x – 223.x.x.x (small, up to /24)
    ============================================================ */
 
 let vlsmData      = [];
@@ -289,6 +242,7 @@ let currentProto  = '';
 function calculate() {
   document.getElementById('error').textContent = '';
 
+  // ── Validate base IP ───────────────────────────────────
   const baseStr = document.getElementById('base').value.trim();
   if (!/^\d+\.\d+\.\d+\.\d+$/.test(baseStr)) {
     showError('Invalid base IP address. Use format: x.x.x.x');
@@ -307,17 +261,66 @@ function calculate() {
   const n        = inputs.length;
   const wanLinks = generateWANLinks(n, selectedTopo);
 
-  // VLSM rule: allocate largest subnet first
+  // Sort hosts descending — VLSM rule: largest subnet first
   const sorted = [...inputs].sort((a, b) => b.h - a.h);
-  let cursor   = ipToInt(baseStr);
+  const baseInt = ipToInt(baseStr);
+
+  // ── Compute address space boundaries ──────────────────
+  // Get the last address of the major classful network
+  const majorLastInt = getMajorLastAddress(baseStr);
+  // Total address space in this major network
+  const majorSize    = (majorLastInt - baseInt + 1) >>> 0;
+
+  // Pre-calculate total space needed for all LAN subnets
+  let   lanSpaceNeeded = 0;
+  const wanSpaceNeeded = wanLinks.length * 4; // each /30 = 4 addresses
+
+  for (const { h } of sorted) {
+    const e = findCidr(h);
+    if (!e) {
+      showError(`No CIDR block found for ${h} hosts. Try a larger base network.`);
+      return;
+    }
+    lanSpaceNeeded += e.block;
+  }
+
+  const totalNeeded = lanSpaceNeeded + wanSpaceNeeded;
+
+  // ── Validate enough space in major network ─────────────
+  if (totalNeeded > majorSize) {
+    const baseClass = getMajorNetworkClass(baseStr);
+    showError(
+      `Not enough address space in ${getMajorNetwork(baseStr)} (${baseClass}). ` +
+      `Need ${totalNeeded.toLocaleString()} addresses, have ${majorSize.toLocaleString()}. ` +
+      `Use a Class ${baseClass === 'C' ? 'B (e.g. 172.16.0.0)' :
+        baseClass === 'B' ? 'A (e.g. 10.0.0.0)' : 'A'} base network or reduce host counts.`
+    );
+    return;
+  }
+
+  // ── WAN reserved block start (end of major network) ───
+  // WAN /30 links are placed at the TAIL of the major network.
+  // This keeps all subnets in the same classful network for RIP.
+  const wanStart = getWanStartAddress(baseStr, wanLinks.length);
 
   // ── LAN subnet allocation ──────────────────────────────
-  for (const { h, rIdx } of sorted) {
-    const e = findCidr(h);
-    if (!e) { showError(`No CIDR block found for ${h} hosts.`); return; }
+  let cursor = baseInt;
 
-    const netInt   = cursor >>> 0;
+  for (const { h, rIdx } of sorted) {
+    const e       = findCidr(h);
+    const netInt  = cursor >>> 0;
     const bcastInt = (netInt + e.block - 1) >>> 0;
+
+    // Safety check: LAN must not overlap WAN reserved space
+    if (bcastInt >= wanStart) {
+      showError(
+        `LAN subnet for R${rIdx + 1} (${h} hosts) overlaps with reserved WAN space. ` +
+        `Use a larger base network (e.g. ${
+          getMajorNetworkClass(baseStr) === 'C' ? '172.16.0.0 (Class B)' : '10.0.0.0 (Class A)'
+        }).`
+      );
+      return;
+    }
 
     const sub = {
       type:      'lan',
@@ -342,22 +345,13 @@ function calculate() {
     cursor = (bcastInt + 1) >>> 0;
   }
 
-  // Sort LAN list by original router order
+  // Sort LAN subnets by original router order (R1, R2, R3...)
   lanSubnets.sort((a, b) => a.routerIdx - b.routerIdx);
 
-  // ── WAN /30 allocation ─────────────────────────────────
-  // CRITICAL RIP FIX: All WAN /30 subnets MUST stay inside the
-  // SAME major classful network as the base IP.
-  //
-  // Problem: if LAN subnets grow past e.g. 172.168.255.x, the next
-  // sequential cursor becomes 172.169.0.0 — a DIFFERENT Class B.
-  // RIP would then see two major networks → discontiguous → broken.
-  //
-  // Solution: place WAN /30 blocks at a known safe address near the
-  // END of the major network, working backwards from the last /30-
-  // aligned address inside the same class boundary.
-  const wanStart = getWanStartAddress(baseStr, wanLinks.length);
-  let wanCursor  = wanStart;
+  // ── WAN /30 allocation (at tail of major network) ──────
+  // Separated from LAN — these represent SERIAL point-to-point links only.
+  // firstIP → OUT side (S0/x/0), lastIP → IN side (S0/x/1)
+  let wanCursor = wanStart;
 
   for (let i = 0; i < wanLinks.length; i++) {
     const wl       = wanLinks[i];
@@ -379,9 +373,9 @@ function calculate() {
       netAddr:   intToIp(netInt),
       netInt,
       mask:      CIDR_30.mask,
-      firstIP:   intToIp(firstInt),
+      firstIP:   intToIp(firstInt),   // OUT side → S0/x/0
       firstInt,
-      lastIP:    intToIp(lastInt),
+      lastIP:    intToIp(lastInt),    // IN  side → S0/x/1
       lastInt,
       broadcast: intToIp(bcastInt),
       bcastInt,
@@ -490,8 +484,8 @@ function renderTable(nextFreeInt, wanNextInt) {
     <div class="s-chip"><span class="s-chip-label">WAN /30 Links</span> <span class="s-chip-val">${serialSubnets.length}</span></div>
     <div class="s-chip"><span class="s-chip-label">Topology</span>      <span class="s-chip-val">${topoLabel}</span></div>
     <div class="s-chip"><span class="s-chip-label">Total Hosts</span>   <span class="s-chip-val">${totalHosts.toLocaleString()}</span></div>
-    <div class="s-chip"><span class="s-chip-label">Next Free (LAN)</span>  <span class="s-chip-val">${intToIp(nextFreeInt)}</span></div>
-    <div class="s-chip"><span class="s-chip-label">Same Major Network</span>  <span class="s-chip-val">${getMajorNetwork(intToIp(nextFreeInt))}</span></div>
+    <div class="s-chip"><span class="s-chip-label">Next Free (LAN)</span> <span class="s-chip-val">${intToIp(nextFreeInt)}</span></div>
+    <div class="s-chip"><span class="s-chip-label">Major Network</span>      <span class="s-chip-val">${getMajorNetwork(intToIp(nextFreeInt)) || "—"}</span></div>
   `;
 }
 
@@ -723,15 +717,27 @@ function generateInterfaces(router) {
   return c;
 }
 
-/* ─────────────────────────────────────────────────────────────
-   HELPER: getMajorNetwork
-   Returns the classful major network for any IP address.
-   This is what Cisco RIP uses — NOT the subnet, NOT the /30.
+/* ============================================================
+   HELPER FUNCTIONS — ROUTING PROTOCOL SUPPORT
+   ============================================================ */
 
-   Class A  (1–126)   → a.0.0.0
-   Class B  (128–191) → a.b.0.0
-   Class C  (192–223) → a.b.c.0
-───────────────────────────────────────────────────────────── */
+/**
+ * getMajorNetwork(ip)
+ * ─────────────────────────────────────────────────────────────
+ * Converts any IP address to its CLASSFUL major network.
+ * This is the exact logic Cisco IOS uses for RIP network statements.
+ *
+ * Cisco classful boundary rules:
+ *   Class A  (1–126)   → a.0.0.0     /8
+ *   Class B  (128–191) → a.b.0.0     /16
+ *   Class C  (192–223) → a.b.c.0     /24
+ *
+ * Examples:
+ *   172.168.0.1       → 172.168.0.0   (Class B)
+ *   172.168.255.241   → 172.168.0.0   (Class B — same major network)
+ *   10.0.0.1          → 10.0.0.0      (Class A)
+ *   192.168.1.1       → 192.168.1.0   (Class C)
+ */
 function getMajorNetwork(ip) {
   const parts = ip.trim().split('.').map(Number);
   const a = parts[0], b = parts[1], c = parts[2];
@@ -741,12 +747,56 @@ function getMajorNetwork(ip) {
   return null;
 }
 
-/* ─────────────────────────────────────────────────────────────
-   HELPER: bfsHopCount
-   Returns the number of hops from a router to the router that
-   owns a given target subnet.  Used to sort static routes
-   farthest → nearest (best practice output order).
-───────────────────────────────────────────────────────────── */
+/**
+ * getMajorLastAddress — Last IP address of a classful major network
+ * Used to compute available address space and validate capacity.
+ */
+
+/**
+ * getWanStartAddress — Places WAN /30 blocks at end of major network
+ *
+ * Ensures ALL WAN subnets stay inside the same classful network as LAN.
+ * Working backwards from the last address of the major network.
+ */
+function getWanStartAddress(baseIp, wanCount) {
+  const majorLastInt = getMajorLastAddress(baseIp);
+  const totalNeeded  = wanCount * 4;
+  let   wanStart     = (majorLastInt - totalNeeded + 1) >>> 0;
+  wanStart           = (wanStart & ~3) >>> 0; // align to /30 boundary
+  return wanStart;
+}
+
+function getMajorLastAddress(ip) {
+  const n      = ipToInt(ip);
+  const first  = (n >>> 24) & 255;
+  const second = (n >>> 16) & 255;
+  const third  = (n >>>  8) & 255;
+
+  if (first >= 1   && first <= 126) return ((first << 24) | 0x00FFFFFF) >>> 0; // Class A
+  if (first >= 128 && first <= 191) return ((first << 24) | (second << 16) | 0x0000FFFF) >>> 0; // Class B
+  return ((first << 24) | (second << 16) | (third << 8) | 0xFF) >>> 0; // Class C
+}
+
+/**
+ * getMajorNetworkClass — Returns 'A', 'B', or 'C' for a given IP
+ */
+function getMajorNetworkClass(ip) {
+  const first = (ipToInt(ip) >>> 24) & 255;
+  if (first >= 1   && first <= 126) return 'A';
+  if (first >= 128 && first <= 191) return 'B';
+  return 'C';
+}
+
+
+/**
+ * bfsHopCount(router, targetSub, routers)
+ * ─────────────────────────────────────────────────────────────
+ * Returns the minimum hop count from a router to the router
+ * that owns a given target subnet using Breadth-First Search.
+ *
+ * Used by generateStatic() to order routes farthest → nearest,
+ * which is the Cisco best-practice output order for static configs.
+ */
 function bfsHopCount(router, targetSub, routers) {
   const visited = new Set([router.idx]);
   const queue   = [...router.outLinks, ...router.inLinks]
@@ -771,20 +821,20 @@ function bfsHopCount(router, targetSub, routers) {
   return 999;
 }
 
-/* ─────────────────────────────────────────────────────────────
-   HELPER: findAlternatePath
-   For ring topology, finds the SECONDARY next-hop to a target
-   (the path going the other way around the ring).
-   Returns null if no alternate path exists (bus topology).
-───────────────────────────────────────────────────────────── */
+/**
+ * findAlternatePath(router, targetSub, primaryNextHop, routers)
+ * ─────────────────────────────────────────────────────────────
+ * Finds the SECONDARY next-hop to a target subnet —
+ * the path going the OTHER direction around the ring.
+ *
+ * Used by generateStatic() to create floating backup routes (AD=5)
+ * in ring topology. Returns null for bus topology (no alternate path).
+ */
 function findAlternatePath(router, targetSub, primaryNextHop, routers) {
-  const allLinks = [...router.outLinks, ...router.inLinks];
-
-  // Collect all neighbor IPs except the one used by primary path
+  const allLinks      = [...router.outLinks, ...router.inLinks];
   const alternateLinks = allLinks.filter(l => l.peer !== primaryNextHop);
 
   for (const link of alternateLinks) {
-    // BFS from this alternate neighbor toward target
     const visited = new Set([router.idx]);
     const queue   = [{ peerIdx: link.peerIdx, nextHop: link.peer }];
 
@@ -808,51 +858,73 @@ function findAlternatePath(router, targetSub, primaryNextHop, routers) {
   return null;
 }
 
+/* ============================================================
+   STAGE 2 — ROUTING PROTOCOL GENERATORS
+   ============================================================
+
+   Administrative Distance reference (lower = more trusted):
+     Static Route   AD = 1
+     EIGRP Internal AD = 90
+     OSPF           AD = 110
+     RIP v2         AD = 120
+
+   All functions:
+     • Start with enable + configure terminal
+     • End with exit (from routing mode) + end
+     • Use no leading spaces on commands
+     • Use ! comment lines (valid Cisco IOS syntax)
+   ============================================================ */
+
 /**
- * Stage 2 — Static Routing
+ * generateStatic(router, routers)
+ * ─────────────────────────────────────────────────────────────
+ * Generates ip route commands following strict Cisco rules:
  *
- * Rules enforced:
- *  ✔ Routes only to REMOTE networks (never directly connected)
- *  ✔ Next-hop = closest neighbor toward destination (BFS)
- *  ✔ Routes ordered farthest → nearest
- *  ✔ Ring topology: primary route + floating backup (AD 5)
- *  ✔ No route to self, no destination as next-hop
+ *  ✔ Routes ONLY to remote networks (never directly connected)
+ *  ✔ Next-hop = the closest BFS neighbor toward the destination
+ *  ✔ Output order: farthest networks first → nearest last
+ *  ✔ Ring topology: primary route (AD=1) + floating backup (AD=5)
+ *  ✔ Bus topology: single primary route per destination
+ *  ✔ Includes both LAN and WAN /30 routes for full reachability
+ *
+ * Floating static route logic (ring only):
+ *   ip route <net> <mask> <primary-nh>      ← AD=1, preferred
+ *   ip route <net> <mask> <backup-nh>  5    ← AD=5, only used if primary fails
+ *
+ * Syntax: ip route <destination> <mask> <next-hop-ip>
  */
 function generateStatic(router, routers) {
-  // Directly connected networks — never generate routes for these
   const myNets = new Set([
     router.lan.netAddr,
     ...router.outLinks.map(l => l.sub.netAddr),
     ...router.inLinks.map(l  => l.sub.netAddr),
   ]);
 
-  // Collect all remote LAN subnets only (WAN /30 routes are optional,
-  // but we include them for full reachability in Packet Tracer)
   const remoteSubs = [...lanSubnets, ...serialSubnets]
     .filter(sub => !myNets.has(sub.netAddr));
 
-  // Sort farthest first (highest hop count first)
-  remoteSubs.sort((a, b) => {
-    const hA = bfsHopCount(router, a, routers);
-    const hB = bfsHopCount(router, b, routers);
-    return hB - hA;
-  });
+  // Sort farthest destinations first (Cisco best-practice output order)
+  remoteSubs.sort((a, b) => bfsHopCount(router, b, routers) - bfsHopCount(router, a, routers));
 
   let c = '';
-  c += 'enable'              + NL;
-  c += 'configure terminal'  + NL;
+  c += 'enable'             + NL;
+  c += 'configure terminal' + NL;
   c += NL;
-  c += '! Static Routing'    + NL;
+  c += '! ── Static Routing ─────────────────────────────────' + NL;
+  c += '! Syntax: ip route <network> <mask> <next-hop>'        + NL;
+  c += '! AD=1 (primary)   AD=5 (floating backup — ring only)' + NL;
   c += NL;
 
   remoteSubs.forEach(sub => {
     const primaryNH = resolveNextHop(router, sub, routers);
     if (!primaryNH) return;
 
-    // Primary route
+    // Primary static route — AD 1 (default, most trusted)
     c += 'ip route ' + sub.netAddr + ' ' + sub.mask + ' ' + primaryNH + NL;
 
-    // Floating backup route for ring topology only
+    // Floating static backup — ring topology only
+    // AD=5: higher than 1 so it is never used while primary is active.
+    // Automatically becomes active if the primary link goes down.
     if (topoUsed === 'ring') {
       const backupNH = findAlternatePath(router, sub, primaryNH, routers);
       if (backupNH && backupNH !== primaryNH) {
@@ -867,30 +939,46 @@ function generateStatic(router, routers) {
 }
 
 /**
- * Stage 2 — RIP v2
+ * generateRIP(router)
+ * ─────────────────────────────────────────────────────────────
+ * Generates RIP v2 configuration following REAL Cisco IOS behavior:
  *
- * Rules enforced (real Cisco IOS behavior):
- *  ✔ Uses getMajorNetwork() — classful boundaries only
- *  ✔ NEVER lists /30 subnets individually
- *  ✔ NEVER lists specific subnets of same major class
- *  ✔ Deduplicates automatically — one entry per major network
- *  ✔ Works for ANY IP range (not hardcoded to 173.168.x.x)
- *  ✔ passive-interface on LAN (stops unnecessary RIP hellos to hosts)
+ * KEY RULE: The `network` command uses CLASSFUL major networks ONLY.
+ *   ✔  network 172.168.0.0     (Class B — covers ALL 172.168.x.x)
+ *   ✘  network 172.168.0.0    (wrong — DO NOT also add:)
+ *   ✘  network 172.168.255.240 (this is a subnet, not a major network)
  *
- * Example: if all IPs are 172.168.x.x:
- *   → ONLY outputs: network 172.168.0.0
- *   NOT: network 172.168.0.0 + network 172.168.194.128 (WRONG)
+ * How it works:
+ *   1. Collect every IP configured on this router (LAN + all serials)
+ *   2. Convert each IP to its classful major network
+ *   3. Deduplicate → one network statement per unique major network
+ *   4. If all subnets are 172.168.x.x → only ONE statement needed
+ *
+ * passive-interface FastEthernet0/0:
+ *   Stops RIP hello packets from being sent to LAN end hosts.
+ *   Prevents routing table leakage and unnecessary traffic on LAN.
+ *   The interface still RECEIVES updates — it just stops SENDING them.
+ *
+ * no auto-summary:
+ *   Required for classless routing. Without it, RIP auto-summarizes
+ *   routes at class boundaries, causing discontiguous network issues.
+ *
+ * Discontiguous network warning:
+ *   If LAN is 172.168.x.x but WAN /30 falls in 172.169.x.x,
+ *   two major networks are needed — RIP will have routing issues.
+ *   The VLSM calculator prevents this by placing all /30 links
+ *   inside the same major network as the base IP.
  */
 function generateRIP(router) {
   const allLinks = [...router.outLinks, ...router.inLinks];
 
-  // Collect every IP this router has configured
+  // Collect all IPs on this router: LAN + all serial interfaces
   const allIPs = [
     router.lan.firstIP,
     ...allLinks.map(l => l.ip),
   ];
 
-  // Convert each IP to its classful major network and deduplicate
+  // Convert to classful major networks and deduplicate
   const majorNets = new Set();
   allIPs.forEach(ip => {
     const major = getMajorNetwork(ip);
@@ -898,63 +986,147 @@ function generateRIP(router) {
   });
 
   let c = '';
-  c += 'enable'              + NL;
-  c += 'configure terminal'  + NL;
+  c += 'enable'                                                         + NL;
+  c += 'configure terminal'                                             + NL;
   c += NL;
-  c += 'router rip'          + NL;
-  c += 'version 2'           + NL;
-  c += 'no auto-summary'     + NL;
+  c += '! ── RIP Version 2 ──────────────────────────────────'          + NL;
+  c += '! Classful major network statements only'                        + NL;
+  c += '! One "network" covers ALL subnets of that class'               + NL;
+  c += NL;
+  c += 'router rip'                                                      + NL;
+  c += 'version 2'                                                       + NL;
+  c += 'no auto-summary'                                                 + NL;
 
-  // One network statement per unique major network
   majorNets.forEach(net => {
-    c += 'network ' + net    + NL;
+    c += 'network ' + net + NL;
   });
 
-  // passive-interface on LAN — prevents RIP updates to end hosts
-  c += 'passive-interface FastEthernet0/0' + NL;
-
-  c += 'exit'                + NL;
+  // passive-interface: suppress RIP hellos toward LAN hosts
+  // The LAN still participates in RIP — it just stops sending updates outward
+  c += 'passive-interface FastEthernet0/0'                               + NL;
+  c += 'exit'                                                            + NL;
   c += NL;
-  c += 'end'                 + NL;
+  c += 'end'                                                             + NL;
   return c;
 }
 
-/** Stage 2 — OSPF */
+/**
+ * generateOSPF(router)
+ * ─────────────────────────────────────────────────────────────
+ * Generates OSPF configuration following Cisco IOS rules:
+ *
+ * Process ID (ospf 1):
+ *   Locally significant only — does NOT need to match between routers.
+ *   All routers use Process ID 1 by convention.
+ *
+ * Network statement syntax:
+ *   network <network-address> <wildcard-mask> area <area-id>
+ *   Wildcard mask = bitwise inverse of subnet mask
+ *     /30 → mask 255.255.255.252 → wildcard 0.0.0.3
+ *     /24 → mask 255.255.255.0   → wildcard 0.0.0.255
+ *     /17 → mask 255.255.128.0   → wildcard 0.0.127.255
+ *
+ * OSPF declares EXACT subnets (unlike RIP which uses major classes).
+ * Every interface — LAN and WAN — must be declared individually.
+ *
+ * passive-interface FastEthernet0/0:
+ *   Stops OSPF hello packets on LAN toward end hosts.
+ *   Prevents unnecessary OSPF traffic and neighbor attempts on LAN.
+ *   Interface still advertises its network — just no hellos sent outward.
+ *
+ * Area 0 (backbone area):
+ *   All interfaces in a simple single-area OSPF topology use area 0.
+ *   Required for Packet Tracer standard configurations.
+ */
 function generateOSPF(router) {
   const allLinks = [...router.outLinks, ...router.inLinks];
 
   let c = '';
-  c += 'enable'             + NL;
-  c += 'configure terminal' + NL;
+  c += 'enable'                                                          + NL;
+  c += 'configure terminal'                                              + NL;
   c += NL;
-  c += 'router ospf 1'      + NL;
+  c += '! ── OSPF (Open Shortest Path First) ─────────────────'         + NL;
+  c += '! Process ID 1 — locally significant, need not match peers'     + NL;
+  c += '! Wildcard mask = inverse of subnet mask'                        + NL;
+  c += '! All interfaces declared with exact subnet + wildcard + area 0' + NL;
+  c += NL;
+  c += 'router ospf 1'                                                   + NL;
+
+  // LAN network — advertise exact subnet with wildcard mask
   c += 'network ' + router.lan.netAddr + ' ' + wildcardOf(router.lan.mask) + ' area 0' + NL;
+
+  // WAN serial networks — each /30 declared individually
   allLinks.forEach(link => {
     c += 'network ' + link.sub.netAddr + ' ' + wildcardOf(link.mask) + ' area 0' + NL;
   });
-  c += 'exit' + NL;
+
+  // passive-interface: stops OSPF hellos toward LAN hosts
+  c += 'passive-interface FastEthernet0/0'                               + NL;
+  c += 'exit'                                                            + NL;
   c += NL;
-  c += 'end' + NL;
+  c += 'end'                                                             + NL;
   return c;
 }
 
-/** Stage 2 — EIGRP */
+/**
+ * generateEIGRP(router)
+ * ─────────────────────────────────────────────────────────────
+ * Generates EIGRP configuration following Cisco IOS rules:
+ *
+ * AS number (eigrp 100):
+ *   MUST match on ALL routers in the same EIGRP domain.
+ *   Unlike OSPF process ID, EIGRP AS number is globally significant.
+ *   Mismatched AS numbers = no neighbor adjacency = no routing.
+ *
+ * Network statement with wildcard mask:
+ *   Enables EIGRP on specific interfaces only.
+ *   Same wildcard logic as OSPF — bitwise inverse of subnet mask.
+ *   More precise than classful RIP — every subnet declared individually.
+ *
+ * no auto-summary:
+ *   Required when subnets of the same classful network appear on
+ *   different interfaces. Disables automatic route summarization
+ *   at classful boundaries. Essential for modern networks.
+ *
+ * passive-interface FastEthernet0/0:
+ *   Stops EIGRP hello packets toward LAN end hosts.
+ *   Interface still participates in EIGRP routing — just no hellos outward.
+ *
+ * Administrative Distance:
+ *   EIGRP internal routes = AD 90 (lowest among IGPs = most preferred)
+ *   EIGRP external routes = AD 170
+ *
+ * Multicast address:
+ *   EIGRP uses multicast 224.0.0.10 for neighbor discovery and updates.
+ */
 function generateEIGRP(router) {
   const allLinks = [...router.outLinks, ...router.inLinks];
 
   let c = '';
-  c += 'enable'             + NL;
-  c += 'configure terminal' + NL;
+  c += 'enable'                                                                     + NL;
+  c += 'configure terminal'                                                         + NL;
   c += NL;
-  c += 'router eigrp 100'   + NL;
-  c += 'no auto-summary'    + NL;
-  c += 'network ' + router.lan.netAddr + ' ' + wildcardOf(router.lan.mask) + NL;
+  c += '! ── EIGRP (Enhanced Interior Gateway Routing Protocol) ─'                  + NL;
+  c += '! AS number 100 — MUST match on ALL routers'                                + NL;
+  c += '! Wildcard mask = inverse of subnet mask'                                   + NL;
+  c += '! AD=90 internal (most preferred among dynamic IGPs)'                       + NL;
+  c += NL;
+  c += 'router eigrp 100'                                                           + NL;
+  c += 'no auto-summary'                                                            + NL;
+
+  // LAN network — exact subnet with wildcard mask
+  c += 'network ' + router.lan.netAddr + ' ' + wildcardOf(router.lan.mask)         + NL;
+
+  // WAN serial networks — each /30 declared individually
   allLinks.forEach(link => {
-    c += 'network ' + link.sub.netAddr + ' ' + wildcardOf(link.mask) + NL;
+    c += 'network ' + link.sub.netAddr + ' ' + wildcardOf(link.mask)               + NL;
   });
-  c += 'exit' + NL;
+
+  // passive-interface: stops EIGRP hellos toward LAN hosts
+  c += 'passive-interface FastEthernet0/0'                                          + NL;
+  c += 'exit'                                                                       + NL;
   c += NL;
-  c += 'end' + NL;
+  c += 'end'                                                                        + NL;
   return c;
 }
 

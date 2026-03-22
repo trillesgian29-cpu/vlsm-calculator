@@ -649,23 +649,142 @@ function generateInterfaces(router) {
   return c;
 }
 
-/** Stage 2 — Static Routing */
+/* ─────────────────────────────────────────────────────────────
+   HELPER: getMajorNetwork
+   Returns the classful major network for any IP address.
+   This is what Cisco RIP uses — NOT the subnet, NOT the /30.
+
+   Class A  (1–126)   → a.0.0.0
+   Class B  (128–191) → a.b.0.0
+   Class C  (192–223) → a.b.c.0
+───────────────────────────────────────────────────────────── */
+function getMajorNetwork(ip) {
+  const parts = ip.trim().split('.').map(Number);
+  const a = parts[0], b = parts[1], c = parts[2];
+  if (a >= 1   && a <= 126) return a + '.0.0.0';
+  if (a >= 128 && a <= 191) return a + '.' + b + '.0.0';
+  if (a >= 192 && a <= 223) return a + '.' + b + '.' + c + '.0';
+  return null;
+}
+
+/* ─────────────────────────────────────────────────────────────
+   HELPER: bfsHopCount
+   Returns the number of hops from a router to the router that
+   owns a given target subnet.  Used to sort static routes
+   farthest → nearest (best practice output order).
+───────────────────────────────────────────────────────────── */
+function bfsHopCount(router, targetSub, routers) {
+  const visited = new Set([router.idx]);
+  const queue   = [...router.outLinks, ...router.inLinks]
+                    .map(l => ({ peerIdx: l.peerIdx, hops: 1 }));
+
+  while (queue.length) {
+    const { peerIdx, hops } = queue.shift();
+    if (visited.has(peerIdx)) continue;
+    visited.add(peerIdx);
+
+    const pr = routers.find(r => r.idx === peerIdx);
+    if (!pr) continue;
+
+    if (pr.lan.netAddr === targetSub.netAddr) return hops;
+    const prAll = [...pr.outLinks, ...pr.inLinks];
+    if (prAll.some(pl => pl.sub.netAddr === targetSub.netAddr)) return hops;
+
+    prAll.forEach(l => {
+      if (!visited.has(l.peerIdx)) queue.push({ peerIdx: l.peerIdx, hops: hops + 1 });
+    });
+  }
+  return 999;
+}
+
+/* ─────────────────────────────────────────────────────────────
+   HELPER: findAlternatePath
+   For ring topology, finds the SECONDARY next-hop to a target
+   (the path going the other way around the ring).
+   Returns null if no alternate path exists (bus topology).
+───────────────────────────────────────────────────────────── */
+function findAlternatePath(router, targetSub, primaryNextHop, routers) {
+  const allLinks = [...router.outLinks, ...router.inLinks];
+
+  // Collect all neighbor IPs except the one used by primary path
+  const alternateLinks = allLinks.filter(l => l.peer !== primaryNextHop);
+
+  for (const link of alternateLinks) {
+    // BFS from this alternate neighbor toward target
+    const visited = new Set([router.idx]);
+    const queue   = [{ peerIdx: link.peerIdx, nextHop: link.peer }];
+
+    while (queue.length) {
+      const { peerIdx, nextHop } = queue.shift();
+      if (visited.has(peerIdx)) continue;
+      visited.add(peerIdx);
+
+      const pr = routers.find(r => r.idx === peerIdx);
+      if (!pr) continue;
+
+      if (pr.lan.netAddr === targetSub.netAddr) return nextHop;
+      const prAll = [...pr.outLinks, ...pr.inLinks];
+      if (prAll.some(pl => pl.sub.netAddr === targetSub.netAddr)) return nextHop;
+
+      prAll.forEach(s => {
+        if (!visited.has(s.peerIdx)) queue.push({ peerIdx: s.peerIdx, nextHop });
+      });
+    }
+  }
+  return null;
+}
+
+/**
+ * Stage 2 — Static Routing
+ *
+ * Rules enforced:
+ *  ✔ Routes only to REMOTE networks (never directly connected)
+ *  ✔ Next-hop = closest neighbor toward destination (BFS)
+ *  ✔ Routes ordered farthest → nearest
+ *  ✔ Ring topology: primary route + floating backup (AD 5)
+ *  ✔ No route to self, no destination as next-hop
+ */
 function generateStatic(router, routers) {
+  // Directly connected networks — never generate routes for these
   const myNets = new Set([
     router.lan.netAddr,
     ...router.outLinks.map(l => l.sub.netAddr),
     ...router.inLinks.map(l  => l.sub.netAddr),
   ]);
 
+  // Collect all remote LAN subnets only (WAN /30 routes are optional,
+  // but we include them for full reachability in Packet Tracer)
+  const remoteSubs = [...lanSubnets, ...serialSubnets]
+    .filter(sub => !myNets.has(sub.netAddr));
+
+  // Sort farthest first (highest hop count first)
+  remoteSubs.sort((a, b) => {
+    const hA = bfsHopCount(router, a, routers);
+    const hB = bfsHopCount(router, b, routers);
+    return hB - hA;
+  });
+
   let c = '';
-  c += 'enable'             + NL;
-  c += 'configure terminal' + NL;
+  c += 'enable'              + NL;
+  c += 'configure terminal'  + NL;
+  c += NL;
+  c += '! Static Routing'    + NL;
   c += NL;
 
-  [...lanSubnets, ...serialSubnets].forEach(sub => {
-    if (myNets.has(sub.netAddr)) return;
-    const nh = resolveNextHop(router, sub, routers);
-    if (nh) c += 'ip route ' + sub.netAddr + ' ' + sub.mask + ' ' + nh + NL;
+  remoteSubs.forEach(sub => {
+    const primaryNH = resolveNextHop(router, sub, routers);
+    if (!primaryNH) return;
+
+    // Primary route
+    c += 'ip route ' + sub.netAddr + ' ' + sub.mask + ' ' + primaryNH + NL;
+
+    // Floating backup route for ring topology only
+    if (topoUsed === 'ring') {
+      const backupNH = findAlternatePath(router, sub, primaryNH, routers);
+      if (backupNH && backupNH !== primaryNH) {
+        c += 'ip route ' + sub.netAddr + ' ' + sub.mask + ' ' + backupNH + ' 5' + NL;
+      }
+    }
   });
 
   c += NL;
@@ -673,25 +792,56 @@ function generateStatic(router, routers) {
   return c;
 }
 
-/** Stage 2 — RIP v2 */
+/**
+ * Stage 2 — RIP v2
+ *
+ * Rules enforced (real Cisco IOS behavior):
+ *  ✔ Uses getMajorNetwork() — classful boundaries only
+ *  ✔ NEVER lists /30 subnets individually
+ *  ✔ NEVER lists specific subnets of same major class
+ *  ✔ Deduplicates automatically — one entry per major network
+ *  ✔ Works for ANY IP range (not hardcoded to 173.168.x.x)
+ *  ✔ passive-interface on LAN (stops unnecessary RIP hellos to hosts)
+ *
+ * Example: if all IPs are 172.168.x.x:
+ *   → ONLY outputs: network 172.168.0.0
+ *   NOT: network 172.168.0.0 + network 172.168.194.128 (WRONG)
+ */
 function generateRIP(router) {
   const allLinks = [...router.outLinks, ...router.inLinks];
-  const nets = new Set([
-    classfulNet(router.lan.netAddr),
-    ...allLinks.map(l => classfulNet(l.sub.netAddr)),
-  ]);
+
+  // Collect every IP this router has configured
+  const allIPs = [
+    router.lan.firstIP,
+    ...allLinks.map(l => l.ip),
+  ];
+
+  // Convert each IP to its classful major network and deduplicate
+  const majorNets = new Set();
+  allIPs.forEach(ip => {
+    const major = getMajorNetwork(ip);
+    if (major) majorNets.add(major);
+  });
 
   let c = '';
-  c += 'enable'             + NL;
-  c += 'configure terminal' + NL;
+  c += 'enable'              + NL;
+  c += 'configure terminal'  + NL;
   c += NL;
-  c += 'router rip'         + NL;
-  c += 'version 2'          + NL;
-  c += 'no auto-summary'    + NL;
-  nets.forEach(net => { c += 'network ' + net + NL; });
-  c += 'exit'               + NL;
+  c += 'router rip'          + NL;
+  c += 'version 2'           + NL;
+  c += 'no auto-summary'     + NL;
+
+  // One network statement per unique major network
+  majorNets.forEach(net => {
+    c += 'network ' + net    + NL;
+  });
+
+  // passive-interface on LAN — prevents RIP updates to end hosts
+  c += 'passive-interface FastEthernet0/0' + NL;
+
+  c += 'exit'                + NL;
   c += NL;
-  c += 'end' + NL;
+  c += 'end'                 + NL;
   return c;
 }
 

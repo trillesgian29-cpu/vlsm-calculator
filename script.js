@@ -1,42 +1,22 @@
 /**
  * VLSM Calculator — script.js
  * ============================================================
- * Offline VLSM Calculator with Cisco IOS CLI Generator
+ * Accurate, Cisco-valid VLSM + Routing Configuration Generator
  *
- * STRICT PORT ASSIGNMENT RULE (Cisco Convention):
- * ─────────────────────────────────────────────────
- *  Every WAN link is DIRECTIONAL:  RouterA → RouterB
- *
- *  RouterA side = OUT  →  Serial0/1/0  →  firstIP  of /30
- *  RouterB side = IN   →  Serial0/1/1  →  lastIP   of /30
- *
- *  Multiple links per router (ring topology):
- *    1st OUT link  →  Serial0/1/0
- *    2nd OUT link  →  Serial0/2/0   (ring closing link)
- *    1st IN  link  →  Serial0/1/1
- *    2nd IN  link  →  Serial0/2/1
- *
- *  This guarantees:
- *    ✔  Every link has exactly 1 OUT and 1 IN port
- *    ✔  No OUT↔OUT or IN↔IN conflicts
- *    ✔  firstIP always goes to OUT side
- *    ✔  lastIP  always goes to IN  side
- *
- * Modules:
- *  1.  IP Utility Functions
- *  2.  CIDR Reference Table
- *  3.  Host Input Box Management
- *  4.  Topology Selection & WAN Link Generation
- *  5.  Core VLSM Calculation
- *  6.  Table Renderer
- *  7.  Router Object Builder (strict direction-aware)
- *  8.  Visual Connection Map
- *  9.  Next-Hop Resolver (BFS)
- *  10. Cisco IOS CLI Builders — Stage 1 & 2
- *  11. CLI Renderer
- *  12. Copy & Export
- *  13. Excel Table Export
- *  14. Initialisation
+ * KEY DESIGN RULES:
+ * ─────────────────
+ *  1. VLSM: 2^n - 2 >= hosts → CIDR = 32 - n
+ *  2. LAN subnets: sequential from base IP, largest first
+ *  3. WAN /30 subnets: sequential AFTER all LAN subnets
+ *     (placed at end of address space to avoid boundary crossing)
+ *  4. Port assignment:
+ *       OUT side → Serial0/1/0 → firstIP of /30
+ *       IN  side → Serial0/1/1 → lastIP  of /30
+ *  5. Static routing: LAN ONLY, farthest → nearest, BFS next-hop
+ *  6. RIP: classful major network, one statement per class
+ *  7. OSPF: wildcard masks, area 0, passive LAN interface
+ *  8. EIGRP: wildcard masks, AS 100, no auto-summary
+ *  9. clock rate 64000 on OUT (DCE) serial interfaces
  * ============================================================
  */
 
@@ -55,21 +35,43 @@ function intToIp(n) {
   return [(n >>> 24) & 255, (n >>> 16) & 255, (n >>> 8) & 255, n & 255].join('.');
 }
 
-/** Wildcard mask — bitwise NOT of subnet mask. Used by OSPF/EIGRP. */
 function wildcardOf(mask) {
   return intToIp((~ipToInt(mask)) >>> 0);
 }
 
-/** Classful network for RIP v2. Class A ≤127 → /8, Class B ≤191 → /16, C → /24 */
-function classfulNet(ip) {
-  const n = ipToInt(ip), f = (n >>> 24) & 255;
-  if (f <= 127) return intToIp(n & 0xFF000000);
-  if (f <= 191) return intToIp(n & 0xFFFF0000);
-  return intToIp(n & 0xFFFFFF00);
+/**
+ * getMajorNetwork — Classful network for RIP
+ * Class A (1-126)   → a.0.0.0
+ * Class B (128-191) → a.b.0.0
+ * Class C (192-223) → a.b.c.0
+ */
+function getMajorNetwork(ip) {
+  const p = ip.trim().split('.').map(Number);
+  const a = p[0], b = p[1], c = p[2];
+  if (a >= 1   && a <= 126) return `${a}.0.0.0`;
+  if (a >= 128 && a <= 191) return `${a}.${b}.0.0`;
+  if (a >= 192 && a <= 223) return `${a}.${b}.${c}.0`;
+  return null;
+}
+
+function getMajorLastInt(ip) {
+  const n = ipToInt(ip);
+  const a = (n >>> 24) & 255, b = (n >>> 16) & 255, c = (n >>> 8) & 255;
+  if (a >= 1   && a <= 126) return ((a << 24) | 0x00FFFFFF) >>> 0;
+  if (a >= 128 && a <= 191) return ((a << 24) | (b << 16) | 0x0000FFFF) >>> 0;
+  return ((a << 24) | (b << 16) | (c << 8) | 0xFF) >>> 0;
+}
+
+function getMajorClass(ip) {
+  const a = (ipToInt(ip) >>> 24) & 255;
+  if (a >= 1   && a <= 126) return 'A';
+  if (a >= 128 && a <= 191) return 'B';
+  return 'C';
 }
 
 /* ============================================================
-   2. CIDR REFERENCE TABLE
+   2. CIDR TABLE
+   Formula: 2^n - 2 >= hosts → CIDR = 32 - n
    ============================================================ */
 
 const CIDR_TABLE = [
@@ -98,7 +100,7 @@ const CIDR_TABLE = [
   { cidr:  8, block: 16777216, usable: 16777214, incr: 1,   mask: '255.0.0.0',       octet: '1st' },
 ];
 
-const CIDR_30 = { cidr: 30, block: 4, usable: 2, incr: 4, mask: '255.255.255.252', octet: '4th' };
+const CIDR_30 = CIDR_TABLE[0]; // /30
 
 function findCidr(hosts) {
   for (const e of CIDR_TABLE) if (e.usable >= hosts) return e;
@@ -165,6 +167,7 @@ function selectTopo(topo) {
   selectedTopo = topo;
   ['bus', 'ring'].forEach(t => {
     const c = document.getElementById(`topo-${t}`);
+    if (!c) return;
     c.classList.toggle('active', t === topo);
     c.setAttribute('aria-checked', t === topo ? 'true' : 'false');
   });
@@ -172,14 +175,10 @@ function selectTopo(topo) {
 }
 
 /**
- * Generates ordered WAN link definitions based on topology.
- *
- * Bus:  R1→R2, R2→R3, ..., R(N-1)→RN        (N-1 links)
- * Ring: R1→R2, R2→R3, ..., R(N-1)→RN, RN→R1 (N   links)
- *
- * DIRECTION RULE:
- *   r0 = OUT side (Serial0/x/0, firstIP)
- *   r1 = IN  side (Serial0/x/1, lastIP)
+ * generateWANLinks — ordered directional WAN link list
+ * Bus:  R1→R2, R2→R3, ..., R(N-1)→RN       (N-1 links)
+ * Ring: R1→R2, R2→R3, ..., RN→R1           (N links)
+ * r0 = OUT side, r1 = IN side
  */
 function generateWANLinks(n, topo) {
   const links = [];
@@ -196,6 +195,7 @@ function updateWanPreview() {
   const n       = getRouterCount();
   const preview = document.getElementById('wanPreview');
   const info    = document.getElementById('topoInfo');
+  if (!preview || !info) return;
 
   if (n < 2) {
     preview.classList.add('hidden');
@@ -212,25 +212,17 @@ function updateWanPreview() {
     links.map(l => `<span class="wan-tag">🔗 ${l.label} Link</span>`).join('');
 
   info.classList.remove('hidden');
-  info.innerHTML = `Topology: <b>${topoLabel}</b> · ${n} routers → <b>${links.length} /30 WAN links</b> auto-generated`;
+  info.innerHTML = `Topology: <b>${topoLabel}</b> · ${n} routers → <b>${links.length} /30 WAN links</b>`;
 }
 
 /* ============================================================
    5. CORE VLSM CALCULATION
    ============================================================
-   KEY DESIGN DECISIONS:
-   ─────────────────────
-   1. LAN subnets allocate sequentially from base IP (largest first)
-   2. WAN /30 subnets are placed at the END of the major network
-      → This keeps ALL subnets in the SAME classful network
-      → Required for RIP to work with a single network statement
-   3. Before allocating, we validate total space needed vs available
-   4. If LAN subnets would overlap with WAN reserved space → error
-
-   Supported base networks: ANY valid IPv4 classful address
-     Class A: 1.x.x.x – 126.x.x.x  (large, up to /8)
-     Class B: 128.x.x.x – 191.x.x.x (medium, up to /16)
-     Class C: 192.x.x.x – 223.x.x.x (small, up to /24)
+   ALLOCATION STRATEGY:
+   - LAN subnets: sequential from baseIP, sorted largest→smallest
+   - WAN /30s: sequential AFTER all LAN subnets
+   - If LAN subnets would cross the major network boundary,
+     show clear error with recommendation
    ============================================================ */
 
 let vlsmData      = [];
@@ -240,19 +232,17 @@ let topoUsed      = '';
 let currentProto  = '';
 
 function calculate() {
-  document.getElementById('error').textContent = '';
+  const errEl = document.getElementById('error');
+  errEl.textContent = '';
 
-  // ── Validate base IP ───────────────────────────────────
   const baseStr = document.getElementById('base').value.trim();
   if (!/^\d+\.\d+\.\d+\.\d+$/.test(baseStr)) {
-    showError('Invalid base IP address. Use format: x.x.x.x');
-    return;
+    showError('Invalid base IP. Use format: x.x.x.x'); return;
   }
 
   const inputs = getHostInputs();
   if (!inputs.length) {
-    showError('Add at least one router with a host count.');
-    return;
+    showError('Add at least one router with a host count.'); return;
   }
 
   vlsmData = []; lanSubnets = []; serialSubnets = [];
@@ -261,174 +251,140 @@ function calculate() {
   const n        = inputs.length;
   const wanLinks = generateWANLinks(n, selectedTopo);
 
-  // Sort hosts descending — VLSM rule: largest subnet first
+  // Sort descending — VLSM: largest subnet first
   const sorted = [...inputs].sort((a, b) => b.h - a.h);
-  const baseInt = ipToInt(baseStr);
 
-  // ── Compute address space boundaries ──────────────────
-  // Get the last address of the major classful network
-  const majorLastInt = getMajorLastAddress(baseStr);
-  // Total address space in this major network
-  const majorSize    = (majorLastInt - baseInt + 1) >>> 0;
+  const baseInt     = ipToInt(baseStr);
+  const majorLast   = getMajorLastInt(baseStr);
+  const majorSize   = (majorLast - baseInt + 1) >>> 0;
+  const majorClass  = getMajorClass(baseStr);
+  const majorNet    = getMajorNetwork(baseStr);
 
-  // Pre-calculate total space needed for all LAN subnets
-  let   lanSpaceNeeded = 0;
-  const wanSpaceNeeded = wanLinks.length * 4; // each /30 = 4 addresses
-
+  // Pre-check: total address space needed
+  let lanTotal = 0;
   for (const { h } of sorted) {
     const e = findCidr(h);
-    if (!e) {
-      showError(`No CIDR block found for ${h} hosts. Try a larger base network.`);
-      return;
-    }
-    lanSpaceNeeded += e.block;
+    if (!e) { showError(`No CIDR for ${h} hosts. Value too large.`); return; }
+    lanTotal += e.block;
   }
+  const wanTotal = wanLinks.length * 4;
 
-  const totalNeeded = lanSpaceNeeded + wanSpaceNeeded;
-
-  // ── Validate enough space in major network ─────────────
-  if (totalNeeded > majorSize) {
-    const baseClass = getMajorNetworkClass(baseStr);
+  if (lanTotal + wanTotal > majorSize) {
+    const suggest = majorClass === 'C'
+      ? '172.16.0.0 (Class B, 65534 hosts)'
+      : majorClass === 'B'
+      ? '10.0.0.0 (Class A, 16M addresses)'
+      : '10.0.0.0 (Class A)';
     showError(
-      `Not enough address space in ${getMajorNetwork(baseStr)} (${baseClass}). ` +
-      `Need ${totalNeeded.toLocaleString()} addresses, have ${majorSize.toLocaleString()}. ` +
-      `Use a Class ${baseClass === 'C' ? 'B (e.g. 172.16.0.0)' :
-        baseClass === 'B' ? 'A (e.g. 10.0.0.0)' : 'A'} base network or reduce host counts.`
+      `Not enough space in ${majorNet} (Class ${majorClass}, ${majorSize.toLocaleString()} addresses). ` +
+      `Need ${(lanTotal + wanTotal).toLocaleString()}. Try: ${suggest}.`
     );
     return;
   }
 
-  // ── WAN reserved block start (end of major network) ───
-  // WAN /30 links are placed at the TAIL of the major network.
-  // This keeps all subnets in the same classful network for RIP.
-  const wanStart = getWanStartAddress(baseStr, wanLinks.length);
-
-  // ── LAN subnet allocation ──────────────────────────────
+  // ── LAN allocation — sequential from baseIP ─────────
   let cursor = baseInt;
 
   for (const { h, rIdx } of sorted) {
-    const e       = findCidr(h);
-    const netInt  = cursor >>> 0;
-    const bcastInt = (netInt + e.block - 1) >>> 0;
+    const e      = findCidr(h);
+    const net    = cursor >>> 0;
+    const bcast  = (net + e.block - 1) >>> 0;
+    const first  = (net + 1) >>> 0;
+    const last   = (bcast - 1) >>> 0;
 
-    // Safety check: LAN must not overlap WAN reserved space
-    if (bcastInt >= wanStart) {
-      showError(
-        `LAN subnet for R${rIdx + 1} (${h} hosts) overlaps with reserved WAN space. ` +
-        `Use a larger base network (e.g. ${
-          getMajorNetworkClass(baseStr) === 'C' ? '172.16.0.0 (Class B)' : '10.0.0.0 (Class A)'
-        }).`
-      );
-      return;
-    }
-
-    const sub = {
-      type:      'lan',
-      routerIdx: rIdx,
-      label:     `R${rIdx + 1} LAN`,
-      hostsReq:  h,
-      cidr:      e.cidr,
-      usable:    e.usable,
-      octet:     e.octet,
-      incr:      e.incr,
-      netAddr:   intToIp(netInt),
-      netInt,
-      mask:      e.mask,
-      firstIP:   intToIp((netInt + 1) >>> 0),
-      lastIP:    intToIp((bcastInt - 1) >>> 0),
-      broadcast: intToIp(bcastInt),
-      bcastInt,
-      block:     e.block,
-    };
-    vlsmData.push(sub);
-    lanSubnets.push(sub);
-    cursor = (bcastInt + 1) >>> 0;
+    lanSubnets.push({
+      type: 'lan', routerIdx: rIdx,
+      label: `R${rIdx + 1} LAN`,
+      hostsReq: h, cidr: e.cidr, usable: e.usable,
+      octet: e.octet, incr: e.incr,
+      netAddr: intToIp(net), netInt: net,
+      mask: e.mask,
+      firstIP: intToIp(first), firstInt: first,
+      lastIP:  intToIp(last),  lastInt:  last,
+      broadcast: intToIp(bcast), bcastInt: bcast,
+      block: e.block,
+    });
+    cursor = (bcast + 1) >>> 0;
   }
 
-  // Sort LAN subnets by original router order (R1, R2, R3...)
+  // Sort LAN by router order
   lanSubnets.sort((a, b) => a.routerIdx - b.routerIdx);
+  vlsmData.push(...lanSubnets);
 
-  // ── WAN /30 allocation (at tail of major network) ──────
-  // Separated from LAN — these represent SERIAL point-to-point links only.
-  // firstIP → OUT side (S0/x/0), lastIP → IN side (S0/x/1)
-  let wanCursor = wanStart;
-
+  // ── WAN /30 allocation — sequential after LAN ───────
+  // cursor now points right after last LAN subnet
   for (let i = 0; i < wanLinks.length; i++) {
-    const wl       = wanLinks[i];
-    const netInt   = wanCursor >>> 0;
-    const bcastInt = (netInt + 4 - 1) >>> 0;
-    const firstInt = (netInt + 1) >>> 0;
-    const lastInt  = (bcastInt - 1) >>> 0;
+    const wl    = wanLinks[i];
+    const net   = cursor >>> 0;
+    const bcast = (net + 4 - 1) >>> 0;
+    const first = (net + 1) >>> 0; // OUT side
+    const last  = (bcast - 1) >>> 0; // IN side
 
-    const sub = {
-      type:      'wan',
-      label:     `${wl.label} Link`,
-      r0idx:     wl.r0,
-      r1idx:     wl.r1,
-      hostsReq:  2,
-      cidr:      30,
-      usable:    2,
-      octet:     '4th',
-      incr:      4,
-      netAddr:   intToIp(netInt),
-      netInt,
-      mask:      CIDR_30.mask,
-      firstIP:   intToIp(firstInt),   // OUT side → S0/x/0
-      firstInt,
-      lastIP:    intToIp(lastInt),    // IN  side → S0/x/1
-      lastInt,
-      broadcast: intToIp(bcastInt),
-      bcastInt,
-      block:     4,
+    const ser = {
+      type: 'wan',
+      label: `${wl.label} Link`,
+      r0idx: wl.r0, r1idx: wl.r1,
+      hostsReq: 2, cidr: 30, usable: 2,
+      octet: '4th', incr: 4,
+      netAddr: intToIp(net), netInt: net,
+      mask: CIDR_30.mask,
+      firstIP: intToIp(first), firstInt: first, // OUT
+      lastIP:  intToIp(last),  lastInt:  last,  // IN
+      broadcast: intToIp(bcast), bcastInt: bcast,
+      block: 4,
     };
-    vlsmData.push(sub);
-    serialSubnets.push(sub);
-    wanCursor = (bcastInt + 1) >>> 0;
+    serialSubnets.push(ser);
+    vlsmData.push(ser);
+    cursor = (bcast + 1) >>> 0;
   }
 
-  renderTable(cursor, wanCursor);
+  renderTable(cursor);
 
-  document.getElementById('tableCard').classList.remove('hidden');
-  document.getElementById('routingCard').classList.remove('hidden');
-  document.getElementById('cliPanel').classList.add('hidden');
+  document.getElementById('tableCard')?.classList.remove('hidden');
+  document.getElementById('routingCard')?.classList.remove('hidden');
+  document.getElementById('cliPanel')?.classList.add('hidden');
   ['static', 'rip', 'ospf', 'eigrp'].forEach(p =>
-    document.getElementById(`pb-${p}`).classList.remove('active')
+    document.getElementById(`pb-${p}`)?.classList.remove('active')
   );
 
   setTimeout(() =>
-    document.getElementById('tableCard').scrollIntoView({ behavior: 'smooth', block: 'start' }),
+    document.getElementById('tableCard')?.scrollIntoView({ behavior: 'smooth', block: 'start' }),
     60
   );
 }
 
 function clearAll() {
   vlsmData = []; lanSubnets = []; serialSubnets = [];
-  ['vlsmBody', 'cliBlocks', 'summaryRow'].forEach(id =>
-    document.getElementById(id).innerHTML = ''
-  );
-  document.getElementById('error').textContent = '';
+  ['vlsmBody', 'cliBlocks', 'summaryRow'].forEach(id => {
+    const el = document.getElementById(id);
+    if (el) el.innerHTML = '';
+  });
+  const errEl = document.getElementById('error');
+  if (errEl) errEl.textContent = '';
   ['tableCard', 'routingCard', 'cliPanel'].forEach(id =>
-    document.getElementById(id).classList.add('hidden')
+    document.getElementById(id)?.classList.add('hidden')
   );
   ['static', 'rip', 'ospf', 'eigrp'].forEach(p =>
-    document.getElementById(`pb-${p}`).classList.remove('active')
+    document.getElementById(`pb-${p}`)?.classList.remove('active')
   );
 }
 
 function showError(msg) {
-  document.getElementById('error').innerHTML = `<span>⚠</span><span>${msg}</span>`;
+  const el = document.getElementById('error');
+  if (el) el.innerHTML = `<span>⚠</span><span>${msg}</span>`;
 }
 
 /* ============================================================
    6. TABLE RENDERER
    ============================================================ */
 
-function renderTable(nextFreeInt, wanNextInt) {
+function renderTable(nextFreeInt) {
   const body = document.getElementById('vlsmBody');
+  if (!body) return;
   body.innerHTML = '';
   let rowNum = 0;
 
-  // LAN rows — sorted largest-first
+  // LAN rows — sorted largest first
   [...lanSubnets].sort((a, b) => b.hostsReq - a.hostsReq).forEach(s => {
     rowNum++;
     const tr = document.createElement('tr');
@@ -450,13 +406,11 @@ function renderTable(nextFreeInt, wanNextInt) {
     body.appendChild(tr);
   });
 
-  // WAN /30 rows — annotated with OUT/IN
+  // WAN /30 rows
   serialSubnets.forEach(s => {
     rowNum++;
     const tr = document.createElement('tr');
     tr.className = 'row-wan';
-    const r0name = `R${s.r0idx + 1}`;
-    const r1name = `R${s.r1idx + 1}`;
     tr.innerHTML = `
       <td>${rowNum}</td>
       <td><span class="td-badge badge-wan">WAN</span></td>
@@ -466,42 +420,36 @@ function renderTable(nextFreeInt, wanNextInt) {
       <td>4th</td><td>4</td>
       <td class="td-wan-net">${s.netAddr}</td>
       <td class="td-mask">${s.mask}</td>
-      <td class="td-mono">${s.firstIP} <span style="color:#6e7681;font-size:10px;">(OUT · ${r0name} S0/1/0)</span></td>
-      <td class="td-mono">${s.lastIP}  <span style="color:#6e7681;font-size:10px;">(IN  · ${r1name} S0/1/1)</span></td>
+      <td class="td-mono">${s.firstIP} <small style="color:#6e7681">(OUT·R${s.r0idx+1} S0/1/0)</small></td>
+      <td class="td-mono">${s.lastIP}  <small style="color:#6e7681">(IN·R${s.r1idx+1} S0/1/1)</small></td>
       <td class="td-mono">${s.broadcast}</td>`;
     body.appendChild(tr);
   });
 
-  const totalHosts = lanSubnets.reduce((s, r) => s + r.hostsReq, 0);
-  const topoLabel  = topoUsed === 'ring' ? 'Ring' : 'Bus/Linear';
+  const total    = lanSubnets.reduce((s, r) => s + r.hostsReq, 0);
+  const topo     = topoUsed === 'ring' ? 'Ring' : 'Bus/Linear';
+  const majorNet = getMajorNetwork(intToIp(ipToInt(document.getElementById('base').value.trim())));
 
   document.getElementById('tableSubtitle').textContent =
-    `${lanSubnets.length} LAN · ${serialSubnets.length} WAN /30 · ${topoLabel} Topology`;
+    `${lanSubnets.length} LAN · ${serialSubnets.length} WAN /30 · ${topo} Topology · Major: ${majorNet}`;
 
   document.getElementById('summaryRow').innerHTML = `
     <div class="s-chip"><span class="s-chip-label">Routers</span>       <span class="s-chip-val">${lanSubnets.length}</span></div>
     <div class="s-chip"><span class="s-chip-label">LAN Subnets</span>   <span class="s-chip-val">${lanSubnets.length}</span></div>
     <div class="s-chip"><span class="s-chip-label">WAN /30 Links</span> <span class="s-chip-val">${serialSubnets.length}</span></div>
-    <div class="s-chip"><span class="s-chip-label">Topology</span>      <span class="s-chip-val">${topoLabel}</span></div>
-    <div class="s-chip"><span class="s-chip-label">Total Hosts</span>   <span class="s-chip-val">${totalHosts.toLocaleString()}</span></div>
-    <div class="s-chip"><span class="s-chip-label">Next Free (LAN)</span> <span class="s-chip-val">${intToIp(nextFreeInt)}</span></div>
-    <div class="s-chip"><span class="s-chip-label">Major Network</span>      <span class="s-chip-val">${getMajorNetwork(intToIp(nextFreeInt)) || "—"}</span></div>
+    <div class="s-chip"><span class="s-chip-label">Topology</span>      <span class="s-chip-val">${topo}</span></div>
+    <div class="s-chip"><span class="s-chip-label">Total Hosts</span>   <span class="s-chip-val">${total.toLocaleString()}</span></div>
+    <div class="s-chip"><span class="s-chip-label">Next Free</span>     <span class="s-chip-val">${intToIp(nextFreeInt)}</span></div>
+    <div class="s-chip"><span class="s-chip-label">RIP Network</span>   <span class="s-chip-val">${majorNet || '—'}</span></div>
   `;
 }
 
 /* ============================================================
-   7. ROUTER OBJECT BUILDER — STRICT DIRECTION-AWARE PORT ASSIGNMENT
+   7. ROUTER OBJECT BUILDER
    ============================================================
-   RULES:
-     OUT links → Serial0/1/0, Serial0/2/0, Serial0/3/0  (slot = outIdx+1, pin = 0)
-     IN  links → Serial0/1/1, Serial0/2/1, Serial0/3/1  (slot = inIdx+1,  pin = 1)
-
-   firstIP of /30 → OUT router's interface
-   lastIP  of /30 → IN  router's interface
-
-   This is consistent with Cisco point-to-point serial convention:
-     /0 = DCE/DTE OUT side
-     /1 = DCE/DTE IN  side
+   OUT links → Serial0/1/0 (1st), Serial0/2/0 (2nd — ring close)
+   IN  links → Serial0/1/1 (1st), Serial0/2/1 (2nd — ring close)
+   firstIP of /30 → OUT, lastIP → IN
    ============================================================ */
 
 function buildRouters() {
@@ -509,51 +457,34 @@ function buildRouters() {
     idx:      lan.routerIdx + 1,
     hosts:    lan.hostsReq,
     lan,
-    outLinks: [],  // links where this router is the OUT side
-    inLinks:  [],  // links where this router is the IN  side
+    outLinks: [],
+    inLinks:  [],
+    serials:  [],
   }));
 
   serialSubnets.forEach(ser => {
     const rOut = routers.find(r => r.idx === ser.r0idx + 1);
     const rIn  = routers.find(r => r.idx === ser.r1idx + 1);
 
-    if (rOut) {
-      rOut.outLinks.push({
-        sub:     ser,
-        dir:     'OUT',
-        ip:      ser.firstIP,       // OUT gets firstIP
-        mask:    ser.mask,
-        peer:    ser.lastIP,        // peer IP (IN side)
-        peerIdx: ser.r1idx + 1,
-        label:   ser.label,
-      });
-    }
-
-    if (rIn) {
-      rIn.inLinks.push({
-        sub:     ser,
-        dir:     'IN',
-        ip:      ser.lastIP,        // IN gets lastIP
-        mask:    ser.mask,
-        peer:    ser.firstIP,       // peer IP (OUT side)
-        peerIdx: ser.r0idx + 1,
-        label:   ser.label,
-      });
-    }
+    if (rOut) rOut.outLinks.push({
+      sub: ser, dir: 'OUT',
+      ip: ser.firstIP, mask: ser.mask,
+      peer: ser.lastIP, peerIdx: ser.r1idx + 1,
+      label: ser.label,
+    });
+    if (rIn) rIn.inLinks.push({
+      sub: ser, dir: 'IN',
+      ip: ser.lastIP, mask: ser.mask,
+      peer: ser.firstIP, peerIdx: ser.r0idx + 1,
+      label: ser.label,
+    });
   });
 
-  // Assign interface names based on direction
   routers.forEach(router => {
-    // OUT interfaces: Serial0/1/0, Serial0/2/0, ...
-    router.outLinks.forEach((link, i) => {
-      link.iface = `Serial0/${i + 1}/0`;
-    });
-    // IN interfaces: Serial0/1/1, Serial0/2/1, ...
-    router.inLinks.forEach((link, i) => {
-      link.iface = `Serial0/${i + 1}/1`;
-    });
-
-    // Combined list for iteration convenience
+    // OUT → Serial0/1/0, Serial0/2/0 ...
+    router.outLinks.forEach((l, i) => { l.iface = `Serial0/${i + 1}/0`; });
+    // IN  → Serial0/1/1, Serial0/2/1 ...
+    router.inLinks.forEach((l, i)  => { l.iface = `Serial0/${i + 1}/1`; });
     router.serials = [...router.outLinks, ...router.inLinks];
   });
 
@@ -562,51 +493,43 @@ function buildRouters() {
 
 /* ============================================================
    8. VISUAL CONNECTION MAP
-   ============================================================
-   Output format per link:
-
-   R1 (Serial0/1/0) OUT ─────────── IN (Serial0/1/1) R2
-     /30 Network : 172.168.x.x
-     OUT IP      : 172.168.x.x  → R1 Serial0/1/0
-     IN  IP      : 172.168.x.x  → R2 Serial0/1/1
    ============================================================ */
 
 function buildConnectionMap(routers, topo) {
   const N   = '\n';
-  const SEP = '─'.repeat(52);
+  const SEP = '─'.repeat(56);
   let   out = '';
 
-  out += 'CONNECTION MAP — ' + (topo === 'ring' ? 'Ring' : 'Bus/Linear') + ' Topology' + N;
+  out += `CONNECTION MAP — ${topo === 'ring' ? 'Ring' : 'Bus/Linear'} Topology` + N;
   out += SEP + N;
-  out += 'RULE: OUT side → Serial0/x/0  uses firstIP of /30' + N;
-  out += '      IN  side → Serial0/x/1  uses lastIP  of /30' + N;
+  out += 'OUT side → Serial0/x/0  (first usable IP of /30)' + N;
+  out += 'IN  side → Serial0/x/1  (second usable IP of /30)' + N;
+  out += 'DCE clock rate 64000 applied on OUT interfaces' + N;
   out += SEP + N + N;
 
   serialSubnets.forEach((ser, i) => {
-    const rOut   = routers.find(r => r.idx === ser.r0idx + 1);
-    const rIn    = routers.find(r => r.idx === ser.r1idx + 1);
+    const rOut    = routers.find(r => r.idx === ser.r0idx + 1);
+    const rIn     = routers.find(r => r.idx === ser.r1idx + 1);
     if (!rOut || !rIn) return;
 
-    const outLink  = rOut.outLinks.find(l => l.sub.netAddr === ser.netAddr);
-    const inLink   = rIn.inLinks.find(l  => l.sub.netAddr === ser.netAddr);
-    const outIface = outLink ? outLink.iface : 'Serial0/1/0';
-    const inIface  = inLink  ? inLink.iface  : 'Serial0/1/1';
+    const outLink = rOut.outLinks.find(l => l.sub.netAddr === ser.netAddr);
+    const inLink  = rIn.inLinks.find(l  => l.sub.netAddr === ser.netAddr);
+    const outIf   = outLink ? outLink.iface : 'Serial0/1/0';
+    const inIf    = inLink  ? inLink.iface  : 'Serial0/1/1';
 
     out += `Link ${i + 1}: ${ser.label}` + N;
-    out += `  R${rOut.idx} (${outIface}) OUT ─────────── IN (${inIface}) R${rIn.idx}` + N;
-    out += `  /30 Network : ${ser.netAddr}/30  (${ser.mask})` + N;
-    out += `  OUT IP      : ${ser.firstIP}  → R${rOut.idx} ${outIface}` + N;
-    out += `  IN  IP      : ${ser.lastIP}  → R${rIn.idx} ${inIface}` + N;
-    out += N;
+    out += `  R${rOut.idx} (${outIf}) OUT ─────── IN (${inIf}) R${rIn.idx}` + N;
+    out += `  Network : ${ser.netAddr}/30` + N;
+    out += `  OUT IP  : ${ser.firstIP}  → R${rOut.idx} ${outIf} [DCE — clock rate 64000]` + N;
+    out += `  IN  IP  : ${ser.lastIP}  → R${rIn.idx} ${inIf}` + N + N;
   });
 
   out += SEP + N;
-  out += 'FULL CHAIN:  ';
-  // Print chain string  R1 → R2 → R3 → ... (→ R1 if ring)
-  for (let i = 0; i < lanSubnets.length; i++) {
+  out += 'CHAIN: ';
+  lanSubnets.forEach((_, i) => {
     out += `R${i + 1}`;
     if (i < lanSubnets.length - 1) out += ' → ';
-  }
+  });
   if (topo === 'ring' && lanSubnets.length > 2) out += ' → R1';
   out += N;
 
@@ -615,23 +538,22 @@ function buildConnectionMap(routers, topo) {
 
 /* ============================================================
    9. NEXT-HOP RESOLVER — BFS
+   Returns the correct next-hop IP from router toward targetSub
    ============================================================ */
 
 function resolveNextHop(router, targetSub, routers) {
   const allLinks = [...router.outLinks, ...router.inLinks];
 
-  // Direct adjacency check
+  // Direct adjacency
   for (const link of allLinks) {
-    const peer     = routers.find(r => r.idx === link.peerIdx);
+    const peer = routers.find(r => r.idx === link.peerIdx);
     if (!peer) continue;
     if (peer.lan.netAddr === targetSub.netAddr) return link.peer;
-    const peerAll  = [...peer.outLinks, ...peer.inLinks];
-    if (peerAll.some(pl => pl.sub.netAddr === targetSub.netAddr)) return link.peer;
   }
 
-  // Multi-hop BFS (handles ring topology)
+  // BFS multi-hop
   const visited = new Set([router.idx]);
-  const queue   = allLinks.map(s => ({ peerIdx: s.peerIdx, nextHop: s.peer }));
+  const queue   = allLinks.map(l => ({ peerIdx: l.peerIdx, nextHop: l.peer }));
 
   while (queue.length) {
     const { peerIdx, nextHop } = queue.shift();
@@ -640,16 +562,54 @@ function resolveNextHop(router, targetSub, routers) {
 
     const pr = routers.find(r => r.idx === peerIdx);
     if (!pr) continue;
-
     if (pr.lan.netAddr === targetSub.netAddr) return nextHop;
-    const prAll = [...pr.outLinks, ...pr.inLinks];
-    if (prAll.some(pl => pl.sub.netAddr === targetSub.netAddr)) return nextHop;
-    prAll.forEach(s => {
-      if (!visited.has(s.peerIdx)) queue.push({ peerIdx: s.peerIdx, nextHop });
+
+    [...pr.outLinks, ...pr.inLinks].forEach(l => {
+      if (!visited.has(l.peerIdx)) queue.push({ peerIdx: l.peerIdx, nextHop });
     });
   }
 
   return allLinks.length > 0 ? allLinks[0].peer : null;
+}
+
+function bfsHopCount(router, targetSub, routers) {
+  const visited = new Set([router.idx]);
+  const queue   = [...router.outLinks, ...router.inLinks]
+                    .map(l => ({ peerIdx: l.peerIdx, hops: 1 }));
+  while (queue.length) {
+    const { peerIdx, hops } = queue.shift();
+    if (visited.has(peerIdx)) continue;
+    visited.add(peerIdx);
+    const pr = routers.find(r => r.idx === peerIdx);
+    if (!pr) continue;
+    if (pr.lan.netAddr === targetSub.netAddr) return hops;
+    [...pr.outLinks, ...pr.inLinks].forEach(l => {
+      if (!visited.has(l.peerIdx)) queue.push({ peerIdx: l.peerIdx, hops: hops + 1 });
+    });
+  }
+  return 999;
+}
+
+function findAlternatePath(router, targetSub, primaryNextHop, routers) {
+  const allLinks      = [...router.outLinks, ...router.inLinks];
+  const altLinks      = allLinks.filter(l => l.peer !== primaryNextHop);
+
+  for (const link of altLinks) {
+    const visited = new Set([router.idx]);
+    const queue   = [{ peerIdx: link.peerIdx, nextHop: link.peer }];
+    while (queue.length) {
+      const { peerIdx, nextHop } = queue.shift();
+      if (visited.has(peerIdx)) continue;
+      visited.add(peerIdx);
+      const pr = routers.find(r => r.idx === peerIdx);
+      if (!pr) continue;
+      if (pr.lan.netAddr === targetSub.netAddr) return nextHop;
+      [...pr.outLinks, ...pr.inLinks].forEach(l => {
+        if (!visited.has(l.peerIdx)) queue.push({ peerIdx: l.peerIdx, nextHop });
+      });
+    }
+  }
+  return null;
 }
 
 /* ============================================================
@@ -660,56 +620,52 @@ const NL = '\n';
 
 /**
  * Stage 1 — Interface Configuration
- *
- * Pure Cisco IOS syntax:
- *   • No leading spaces before commands
- *   • ! comments are valid IOS syntax (ignored by parser)
- *   • enable + configure terminal at start
- *   • exit after each interface block
- *   • end at bottom
- *
- * Interface order:
- *   1. FastEthernet0/0 (LAN)
- *   2. OUT serial links (Serial0/1/0, Serial0/2/0, ...)
- *   3. IN  serial links (Serial0/1/1, Serial0/2/1, ...)
+ * Rules:
+ *  - No leading spaces before commands
+ *  - enable + configure terminal
+ *  - LAN: FastEthernet0/0
+ *  - OUT serial: clock rate 64000 (DCE side)
+ *  - IN  serial: no clock rate
+ *  - exit after each interface, end at bottom
  */
-function generateInterfaces(router) {
+function buildStage1(router) {
   let c = '';
   c += 'enable'             + NL;
   c += 'configure terminal' + NL;
   c += NL;
 
-  // LAN interface
+  // LAN
   c += '!' + NL;
-  c += '! LAN Interface' + NL;
+  c += `! LAN — R${router.idx} (${router.hosts.toLocaleString()} hosts)` + NL;
   c += '!' + NL;
-  c += 'interface FastEthernet0/0'                                    + NL;
-  c += 'ip address ' + router.lan.firstIP + ' ' + router.lan.mask    + NL;
-  c += 'no shutdown'                                                  + NL;
-  c += 'exit'                                                         + NL;
+  c += 'interface FastEthernet0/0'                                 + NL;
+  c += `ip address ${router.lan.firstIP} ${router.lan.mask}`       + NL;
+  c += 'no shutdown'                                               + NL;
+  c += 'exit'                                                      + NL;
 
-  // OUT serial interfaces
+  // OUT serial interfaces — DCE side, needs clock rate
   router.outLinks.forEach(link => {
     c += NL;
     c += '!' + NL;
-    c += '! OUT to R' + link.peerIdx + ' — ' + link.iface            + NL;
+    c += `! OUT → R${link.peerIdx} | ${link.label} | ${link.iface} [DCE]` + NL;
     c += '!' + NL;
-    c += 'interface ' + link.iface                                    + NL;
-    c += 'ip address ' + link.ip + ' ' + link.mask                   + NL;
-    c += 'no shutdown'                                                + NL;
-    c += 'exit'                                                       + NL;
+    c += `interface ${link.iface}`                                 + NL;
+    c += `ip address ${link.ip} ${link.mask}`                     + NL;
+    c += 'clock rate 64000'                                        + NL;
+    c += 'no shutdown'                                             + NL;
+    c += 'exit'                                                    + NL;
   });
 
-  // IN serial interfaces
+  // IN serial interfaces — DTE side, no clock rate
   router.inLinks.forEach(link => {
     c += NL;
     c += '!' + NL;
-    c += '! IN from R' + link.peerIdx + ' — ' + link.iface           + NL;
+    c += `! IN ← R${link.peerIdx} | ${link.label} | ${link.iface} [DTE]` + NL;
     c += '!' + NL;
-    c += 'interface ' + link.iface                                    + NL;
-    c += 'ip address ' + link.ip + ' ' + link.mask                   + NL;
-    c += 'no shutdown'                                                + NL;
-    c += 'exit'                                                       + NL;
+    c += `interface ${link.iface}`                                 + NL;
+    c += `ip address ${link.ip} ${link.mask}`                     + NL;
+    c += 'no shutdown'                                             + NL;
+    c += 'exit'                                                    + NL;
   });
 
   c += NL;
@@ -717,218 +673,46 @@ function generateInterfaces(router) {
   return c;
 }
 
-/* ============================================================
-   HELPER FUNCTIONS — ROUTING PROTOCOL SUPPORT
-   ============================================================ */
-
 /**
- * getMajorNetwork(ip)
- * ─────────────────────────────────────────────────────────────
- * Converts any IP address to its CLASSFUL major network.
- * This is the exact logic Cisco IOS uses for RIP network statements.
- *
- * Cisco classful boundary rules:
- *   Class A  (1–126)   → a.0.0.0     /8
- *   Class B  (128–191) → a.b.0.0     /16
- *   Class C  (192–223) → a.b.c.0     /24
- *
- * Examples:
- *   172.168.0.1       → 172.168.0.0   (Class B)
- *   172.168.255.241   → 172.168.0.0   (Class B — same major network)
- *   10.0.0.1          → 10.0.0.0      (Class A)
- *   192.168.1.1       → 192.168.1.0   (Class C)
+ * Stage 2 — Static Routing
+ * Rules:
+ *  - Route ONLY to remote LAN networks (NOT WAN /30)
+ *  - Next-hop = nearest neighbor toward destination (BFS)
+ *  - Sort farthest → nearest
+ *  - Ring: primary (AD=1) + floating backup (AD=5)
+ *  - No duplicate routes
  */
-function getMajorNetwork(ip) {
-  const parts = ip.trim().split('.').map(Number);
-  const a = parts[0], b = parts[1], c = parts[2];
-  if (a >= 1   && a <= 126) return a + '.0.0.0';
-  if (a >= 128 && a <= 191) return a + '.' + b + '.0.0';
-  if (a >= 192 && a <= 223) return a + '.' + b + '.' + c + '.0';
-  return null;
-}
-
-/**
- * getMajorLastAddress — Last IP address of a classful major network
- * Used to compute available address space and validate capacity.
- */
-
-/**
- * getWanStartAddress — Places WAN /30 blocks at end of major network
- *
- * Ensures ALL WAN subnets stay inside the same classful network as LAN.
- * Working backwards from the last address of the major network.
- */
-function getWanStartAddress(baseIp, wanCount) {
-  const majorLastInt = getMajorLastAddress(baseIp);
-  const totalNeeded  = wanCount * 4;
-  let   wanStart     = (majorLastInt - totalNeeded + 1) >>> 0;
-  wanStart           = (wanStart & ~3) >>> 0; // align to /30 boundary
-  return wanStart;
-}
-
-function getMajorLastAddress(ip) {
-  const n      = ipToInt(ip);
-  const first  = (n >>> 24) & 255;
-  const second = (n >>> 16) & 255;
-  const third  = (n >>>  8) & 255;
-
-  if (first >= 1   && first <= 126) return ((first << 24) | 0x00FFFFFF) >>> 0; // Class A
-  if (first >= 128 && first <= 191) return ((first << 24) | (second << 16) | 0x0000FFFF) >>> 0; // Class B
-  return ((first << 24) | (second << 16) | (third << 8) | 0xFF) >>> 0; // Class C
-}
-
-/**
- * getMajorNetworkClass — Returns 'A', 'B', or 'C' for a given IP
- */
-function getMajorNetworkClass(ip) {
-  const first = (ipToInt(ip) >>> 24) & 255;
-  if (first >= 1   && first <= 126) return 'A';
-  if (first >= 128 && first <= 191) return 'B';
-  return 'C';
-}
-
-
-/**
- * bfsHopCount(router, targetSub, routers)
- * ─────────────────────────────────────────────────────────────
- * Returns the minimum hop count from a router to the router
- * that owns a given target subnet using Breadth-First Search.
- *
- * Used by generateStatic() to order routes farthest → nearest,
- * which is the Cisco best-practice output order for static configs.
- */
-function bfsHopCount(router, targetSub, routers) {
-  const visited = new Set([router.idx]);
-  const queue   = [...router.outLinks, ...router.inLinks]
-                    .map(l => ({ peerIdx: l.peerIdx, hops: 1 }));
-
-  while (queue.length) {
-    const { peerIdx, hops } = queue.shift();
-    if (visited.has(peerIdx)) continue;
-    visited.add(peerIdx);
-
-    const pr = routers.find(r => r.idx === peerIdx);
-    if (!pr) continue;
-
-    if (pr.lan.netAddr === targetSub.netAddr) return hops;
-    const prAll = [...pr.outLinks, ...pr.inLinks];
-    if (prAll.some(pl => pl.sub.netAddr === targetSub.netAddr)) return hops;
-
-    prAll.forEach(l => {
-      if (!visited.has(l.peerIdx)) queue.push({ peerIdx: l.peerIdx, hops: hops + 1 });
-    });
-  }
-  return 999;
-}
-
-/**
- * findAlternatePath(router, targetSub, primaryNextHop, routers)
- * ─────────────────────────────────────────────────────────────
- * Finds the SECONDARY next-hop to a target subnet —
- * the path going the OTHER direction around the ring.
- *
- * Used by generateStatic() to create floating backup routes (AD=5)
- * in ring topology. Returns null for bus topology (no alternate path).
- */
-function findAlternatePath(router, targetSub, primaryNextHop, routers) {
-  const allLinks      = [...router.outLinks, ...router.inLinks];
-  const alternateLinks = allLinks.filter(l => l.peer !== primaryNextHop);
-
-  for (const link of alternateLinks) {
-    const visited = new Set([router.idx]);
-    const queue   = [{ peerIdx: link.peerIdx, nextHop: link.peer }];
-
-    while (queue.length) {
-      const { peerIdx, nextHop } = queue.shift();
-      if (visited.has(peerIdx)) continue;
-      visited.add(peerIdx);
-
-      const pr = routers.find(r => r.idx === peerIdx);
-      if (!pr) continue;
-
-      if (pr.lan.netAddr === targetSub.netAddr) return nextHop;
-      const prAll = [...pr.outLinks, ...pr.inLinks];
-      if (prAll.some(pl => pl.sub.netAddr === targetSub.netAddr)) return nextHop;
-
-      prAll.forEach(s => {
-        if (!visited.has(s.peerIdx)) queue.push({ peerIdx: s.peerIdx, nextHop });
-      });
-    }
-  }
-  return null;
-}
-
-/* ============================================================
-   STAGE 2 — ROUTING PROTOCOL GENERATORS
-   ============================================================
-
-   Administrative Distance reference (lower = more trusted):
-     Static Route   AD = 1
-     EIGRP Internal AD = 90
-     OSPF           AD = 110
-     RIP v2         AD = 120
-
-   All functions:
-     • Start with enable + configure terminal
-     • End with exit (from routing mode) + end
-     • Use no leading spaces on commands
-     • Use ! comment lines (valid Cisco IOS syntax)
-   ============================================================ */
-
-/**
- * generateStatic(router, routers)
- * ─────────────────────────────────────────────────────────────
- * Generates ip route commands following strict Cisco rules:
- *
- *  ✔ Routes ONLY to remote networks (never directly connected)
- *  ✔ Next-hop = the closest BFS neighbor toward the destination
- *  ✔ Output order: farthest networks first → nearest last
- *  ✔ Ring topology: primary route (AD=1) + floating backup (AD=5)
- *  ✔ Bus topology: single primary route per destination
- *  ✔ Includes both LAN and WAN /30 routes for full reachability
- *
- * Floating static route logic (ring only):
- *   ip route <net> <mask> <primary-nh>      ← AD=1, preferred
- *   ip route <net> <mask> <backup-nh>  5    ← AD=5, only used if primary fails
- *
- * Syntax: ip route <destination> <mask> <next-hop-ip>
- */
-function generateStatic(router, routers) {
+function buildStatic(router, routers) {
   const myNets = new Set([
     router.lan.netAddr,
     ...router.outLinks.map(l => l.sub.netAddr),
     ...router.inLinks.map(l  => l.sub.netAddr),
   ]);
 
-  const remoteSubs = [...lanSubnets, ...serialSubnets]
-    .filter(sub => !myNets.has(sub.netAddr));
-
-  // Sort farthest destinations first (Cisco best-practice output order)
-  remoteSubs.sort((a, b) => bfsHopCount(router, b, routers) - bfsHopCount(router, a, routers));
+  // ONLY remote LAN networks — NOT WAN /30 subnets
+  const remoteLANs = lanSubnets
+    .filter(sub => !myNets.has(sub.netAddr))
+    .sort((a, b) => bfsHopCount(router, b, routers) - bfsHopCount(router, a, routers));
 
   let c = '';
   c += 'enable'             + NL;
   c += 'configure terminal' + NL;
   c += NL;
-  c += '! ── Static Routing ─────────────────────────────────' + NL;
-  c += '! Syntax: ip route <network> <mask> <next-hop>'        + NL;
-  c += '! AD=1 (primary)   AD=5 (floating backup — ring only)' + NL;
+  c += '! Static Routing — remote LAN networks only' + NL;
+  c += '! Format: ip route <network> <mask> <next-hop> [AD]' + NL;
   c += NL;
 
-  remoteSubs.forEach(sub => {
+  remoteLANs.forEach(sub => {
     const primaryNH = resolveNextHop(router, sub, routers);
     if (!primaryNH) return;
 
-    // Primary static route — AD 1 (default, most trusted)
-    c += 'ip route ' + sub.netAddr + ' ' + sub.mask + ' ' + primaryNH + NL;
+    c += `ip route ${sub.netAddr} ${sub.mask} ${primaryNH}` + NL;
 
-    // Floating static backup — ring topology only
-    // AD=5: higher than 1 so it is never used while primary is active.
-    // Automatically becomes active if the primary link goes down.
+    // Ring topology: floating backup via alternate path
     if (topoUsed === 'ring') {
       const backupNH = findAlternatePath(router, sub, primaryNH, routers);
       if (backupNH && backupNH !== primaryNH) {
-        c += 'ip route ' + sub.netAddr + ' ' + sub.mask + ' ' + backupNH + ' 5' + NL;
+        c += `ip route ${sub.netAddr} ${sub.mask} ${backupNH} 5` + NL;
       }
     }
   });
@@ -939,194 +723,93 @@ function generateStatic(router, routers) {
 }
 
 /**
- * generateRIP(router)
- * ─────────────────────────────────────────────────────────────
- * Generates RIP v2 configuration following REAL Cisco IOS behavior:
- *
- * KEY RULE: The `network` command uses CLASSFUL major networks ONLY.
- *   ✔  network 172.168.0.0     (Class B — covers ALL 172.168.x.x)
- *   ✘  network 172.168.0.0    (wrong — DO NOT also add:)
- *   ✘  network 172.168.255.240 (this is a subnet, not a major network)
- *
- * How it works:
- *   1. Collect every IP configured on this router (LAN + all serials)
- *   2. Convert each IP to its classful major network
- *   3. Deduplicate → one network statement per unique major network
- *   4. If all subnets are 172.168.x.x → only ONE statement needed
- *
- * passive-interface FastEthernet0/0:
- *   Stops RIP hello packets from being sent to LAN end hosts.
- *   Prevents routing table leakage and unnecessary traffic on LAN.
- *   The interface still RECEIVES updates — it just stops SENDING them.
- *
- * no auto-summary:
- *   Required for classless routing. Without it, RIP auto-summarizes
- *   routes at class boundaries, causing discontiguous network issues.
- *
- * Discontiguous network warning:
- *   If LAN is 172.168.x.x but WAN /30 falls in 172.169.x.x,
- *   two major networks are needed — RIP will have routing issues.
- *   The VLSM calculator prevents this by placing all /30 links
- *   inside the same major network as the base IP.
+ * Stage 2 — RIP v2
+ * Rules:
+ *  - Classful major network ONLY (not subnets, not /30)
+ *  - One network statement per unique major class
+ *  - passive-interface on LAN
+ *  - Auto-detect: works for any IP range
  */
-function generateRIP(router) {
+function buildRIP(router) {
   const allLinks = [...router.outLinks, ...router.inLinks];
+  const allIPs   = [router.lan.firstIP, ...allLinks.map(l => l.ip)];
 
-  // Collect all IPs on this router: LAN + all serial interfaces
-  const allIPs = [
-    router.lan.firstIP,
-    ...allLinks.map(l => l.ip),
-  ];
-
-  // Convert to classful major networks and deduplicate
   const majorNets = new Set();
   allIPs.forEach(ip => {
-    const major = getMajorNetwork(ip);
-    if (major) majorNets.add(major);
+    const m = getMajorNetwork(ip);
+    if (m) majorNets.add(m);
   });
 
   let c = '';
-  c += 'enable'                                                         + NL;
-  c += 'configure terminal'                                             + NL;
+  c += 'enable'             + NL;
+  c += 'configure terminal' + NL;
   c += NL;
-  c += '! ── RIP Version 2 ──────────────────────────────────'          + NL;
-  c += '! Classful major network statements only'                        + NL;
-  c += '! One "network" covers ALL subnets of that class'               + NL;
+  c += '! RIP v2 — classful major networks only' + NL;
+  c += 'router rip'         + NL;
+  c += 'version 2'          + NL;
+  c += 'no auto-summary'    + NL;
+  majorNets.forEach(net => { c += `network ${net}` + NL; });
+  c += 'passive-interface FastEthernet0/0' + NL;
+  c += 'exit'               + NL;
   c += NL;
-  c += 'router rip'                                                      + NL;
-  c += 'version 2'                                                       + NL;
-  c += 'no auto-summary'                                                 + NL;
-
-  majorNets.forEach(net => {
-    c += 'network ' + net + NL;
-  });
-
-  // passive-interface: suppress RIP hellos toward LAN hosts
-  // The LAN still participates in RIP — it just stops sending updates outward
-  c += 'passive-interface FastEthernet0/0'                               + NL;
-  c += 'exit'                                                            + NL;
-  c += NL;
-  c += 'end'                                                             + NL;
+  c += 'end' + NL;
   return c;
 }
 
 /**
- * generateOSPF(router)
- * ─────────────────────────────────────────────────────────────
- * Generates OSPF configuration following Cisco IOS rules:
- *
- * Process ID (ospf 1):
- *   Locally significant only — does NOT need to match between routers.
- *   All routers use Process ID 1 by convention.
- *
- * Network statement syntax:
- *   network <network-address> <wildcard-mask> area <area-id>
- *   Wildcard mask = bitwise inverse of subnet mask
- *     /30 → mask 255.255.255.252 → wildcard 0.0.0.3
- *     /24 → mask 255.255.255.0   → wildcard 0.0.0.255
- *     /17 → mask 255.255.128.0   → wildcard 0.0.127.255
- *
- * OSPF declares EXACT subnets (unlike RIP which uses major classes).
- * Every interface — LAN and WAN — must be declared individually.
- *
- * passive-interface FastEthernet0/0:
- *   Stops OSPF hello packets on LAN toward end hosts.
- *   Prevents unnecessary OSPF traffic and neighbor attempts on LAN.
- *   Interface still advertises its network — just no hellos sent outward.
- *
- * Area 0 (backbone area):
- *   All interfaces in a simple single-area OSPF topology use area 0.
- *   Required for Packet Tracer standard configurations.
+ * Stage 2 — OSPF
+ * Rules:
+ *  - Process ID 1 (locally significant)
+ *  - Wildcard masks on all network statements
+ *  - area 0 for all interfaces
+ *  - passive-interface on LAN
  */
-function generateOSPF(router) {
+function buildOSPF(router) {
   const allLinks = [...router.outLinks, ...router.inLinks];
 
   let c = '';
-  c += 'enable'                                                          + NL;
-  c += 'configure terminal'                                              + NL;
+  c += 'enable'             + NL;
+  c += 'configure terminal' + NL;
   c += NL;
-  c += '! ── OSPF (Open Shortest Path First) ─────────────────'         + NL;
-  c += '! Process ID 1 — locally significant, need not match peers'     + NL;
-  c += '! Wildcard mask = inverse of subnet mask'                        + NL;
-  c += '! All interfaces declared with exact subnet + wildcard + area 0' + NL;
-  c += NL;
-  c += 'router ospf 1'                                                   + NL;
-
-  // LAN network — advertise exact subnet with wildcard mask
-  c += 'network ' + router.lan.netAddr + ' ' + wildcardOf(router.lan.mask) + ' area 0' + NL;
-
-  // WAN serial networks — each /30 declared individually
-  allLinks.forEach(link => {
-    c += 'network ' + link.sub.netAddr + ' ' + wildcardOf(link.mask) + ' area 0' + NL;
+  c += '! OSPF — Process ID 1, Area 0, wildcard masks' + NL;
+  c += 'router ospf 1'      + NL;
+  c += `network ${router.lan.netAddr} ${wildcardOf(router.lan.mask)} area 0` + NL;
+  allLinks.forEach(l => {
+    c += `network ${l.sub.netAddr} ${wildcardOf(l.mask)} area 0` + NL;
   });
-
-  // passive-interface: stops OSPF hellos toward LAN hosts
-  c += 'passive-interface FastEthernet0/0'                               + NL;
-  c += 'exit'                                                            + NL;
+  c += 'passive-interface FastEthernet0/0' + NL;
+  c += 'exit'               + NL;
   c += NL;
-  c += 'end'                                                             + NL;
+  c += 'end' + NL;
   return c;
 }
 
 /**
- * generateEIGRP(router)
- * ─────────────────────────────────────────────────────────────
- * Generates EIGRP configuration following Cisco IOS rules:
- *
- * AS number (eigrp 100):
- *   MUST match on ALL routers in the same EIGRP domain.
- *   Unlike OSPF process ID, EIGRP AS number is globally significant.
- *   Mismatched AS numbers = no neighbor adjacency = no routing.
- *
- * Network statement with wildcard mask:
- *   Enables EIGRP on specific interfaces only.
- *   Same wildcard logic as OSPF — bitwise inverse of subnet mask.
- *   More precise than classful RIP — every subnet declared individually.
- *
- * no auto-summary:
- *   Required when subnets of the same classful network appear on
- *   different interfaces. Disables automatic route summarization
- *   at classful boundaries. Essential for modern networks.
- *
- * passive-interface FastEthernet0/0:
- *   Stops EIGRP hello packets toward LAN end hosts.
- *   Interface still participates in EIGRP routing — just no hellos outward.
- *
- * Administrative Distance:
- *   EIGRP internal routes = AD 90 (lowest among IGPs = most preferred)
- *   EIGRP external routes = AD 170
- *
- * Multicast address:
- *   EIGRP uses multicast 224.0.0.10 for neighbor discovery and updates.
+ * Stage 2 — EIGRP
+ * Rules:
+ *  - AS 100 (must match on ALL routers)
+ *  - no auto-summary required
+ *  - wildcard masks
+ *  - passive-interface on LAN
  */
-function generateEIGRP(router) {
+function buildEIGRP(router) {
   const allLinks = [...router.outLinks, ...router.inLinks];
 
   let c = '';
-  c += 'enable'                                                                     + NL;
-  c += 'configure terminal'                                                         + NL;
+  c += 'enable'             + NL;
+  c += 'configure terminal' + NL;
   c += NL;
-  c += '! ── EIGRP (Enhanced Interior Gateway Routing Protocol) ─'                  + NL;
-  c += '! AS number 100 — MUST match on ALL routers'                                + NL;
-  c += '! Wildcard mask = inverse of subnet mask'                                   + NL;
-  c += '! AD=90 internal (most preferred among dynamic IGPs)'                       + NL;
-  c += NL;
-  c += 'router eigrp 100'                                                           + NL;
-  c += 'no auto-summary'                                                            + NL;
-
-  // LAN network — exact subnet with wildcard mask
-  c += 'network ' + router.lan.netAddr + ' ' + wildcardOf(router.lan.mask)         + NL;
-
-  // WAN serial networks — each /30 declared individually
-  allLinks.forEach(link => {
-    c += 'network ' + link.sub.netAddr + ' ' + wildcardOf(link.mask)               + NL;
+  c += '! EIGRP AS 100 — AS number MUST match on all routers' + NL;
+  c += 'router eigrp 100'   + NL;
+  c += 'no auto-summary'    + NL;
+  c += `network ${router.lan.netAddr} ${wildcardOf(router.lan.mask)}` + NL;
+  allLinks.forEach(l => {
+    c += `network ${l.sub.netAddr} ${wildcardOf(l.mask)}` + NL;
   });
-
-  // passive-interface: stops EIGRP hellos toward LAN hosts
-  c += 'passive-interface FastEthernet0/0'                                          + NL;
-  c += 'exit'                                                                       + NL;
+  c += 'passive-interface FastEthernet0/0' + NL;
+  c += 'exit'               + NL;
   c += NL;
-  c += 'end'                                                                        + NL;
+  c += 'end' + NL;
   return c;
 }
 
@@ -1153,19 +836,23 @@ function generateCLI(proto) {
 
   currentProto = proto;
   ['static', 'rip', 'ospf', 'eigrp'].forEach(p =>
-    document.getElementById(`pb-${p}`).classList.toggle('active', p === proto)
+    document.getElementById(`pb-${p}`)?.classList.toggle('active', p === proto)
   );
 
   const routers  = buildRouters();
   const blocksEl = document.getElementById('cliBlocks');
+  if (!blocksEl) return;
   blocksEl.innerHTML = '';
 
-  document.getElementById('cliTitleText').textContent =
-    `cisco-ios — ${PROTO_NAMES[proto]} — ${topoUsed} topology`;
-  document.getElementById('cliProtoBadge').innerHTML =
+  // Update terminal title
+  const titleEl = document.getElementById('cliTitleText');
+  if (titleEl) titleEl.textContent = `cisco-ios — ${PROTO_NAMES[proto]} — ${topoUsed} topology`;
+
+  const badgeEl = document.getElementById('cliProtoBadge');
+  if (badgeEl) badgeEl.innerHTML =
     `<span class="cli-proto-badge ${PROTO_BADGE_CLASS[proto]}">${PROTO_NAMES[proto]}</span>`;
 
-  // ── Connection Map block ──────────────────────────────
+  // ── Connection Map ────────────────────────────────────
   const mapText  = buildConnectionMap(routers, topoUsed);
   const mapBlock = document.createElement('div');
   mapBlock.className = 'router-block';
@@ -1174,16 +861,16 @@ function generateCLI(proto) {
   mapBlock._stage2   = '';
   mapBlock._label    = 'Connection Map';
 
-  const mapHdr     = document.createElement('div');
+  const mapHdr = document.createElement('div');
   mapHdr.className = 'router-block-header';
   mapHdr.innerHTML = `
     <span class="router-block-title">🔗 Connection Map — Port & IP Assignment</span>
     <div class="router-block-btns">
-      <button class="cli-btn cli-btn-copy" onclick="copyBlock(this)">⎘ Copy Map</button>
+      <button class="cli-btn cli-btn-copy" onclick="copyBlock(this)">⎘ Copy</button>
     </div>`;
   mapBlock.appendChild(mapHdr);
 
-  const mapCode     = document.createElement('div');
+  const mapCode = document.createElement('div');
   mapCode.className = 'cli-code';
   mapCode.style.color = '#60a5fa';
   mapCode.textContent = mapText;
@@ -1192,28 +879,26 @@ function generateCLI(proto) {
 
   // ── Per-router CLI blocks ─────────────────────────────
   routers.forEach(router => {
-    const stage1 = generateInterfaces(router);
-    let   stage2 = '';
-
+    const s1 = buildStage1(router);
+    let   s2 = '';
     switch (proto) {
-      case 'static': stage2 = generateStatic(router, routers); break;
-      case 'rip':    stage2 = generateRIP(router);             break;
-      case 'ospf':   stage2 = generateOSPF(router);            break;
-      case 'eigrp':  stage2 = generateEIGRP(router);           break;
+      case 'static': s2 = buildStatic(router, routers); break;
+      case 'rip':    s2 = buildRIP(router);              break;
+      case 'ospf':   s2 = buildOSPF(router);             break;
+      case 'eigrp':  s2 = buildEIGRP(router);            break;
     }
+    const fullCli = s1 + NL + s2;
+    const outP    = router.outLinks.map(l => `${l.iface}→R${l.peerIdx}(${l.ip})`).join(', ') || '—';
+    const inP     = router.inLinks.map(l  => `${l.iface}←R${l.peerIdx}(${l.ip})`).join(', ') || '—';
+    const title   = `Router ${router.idx} — ${router.hosts.toLocaleString()} Hosts — LAN: ${router.lan.netAddr}/${router.lan.cidr}`;
+    const ports   = `OUT: ${outP}  |  IN: ${inP}`;
 
-    const fullCli  = stage1 + NL + stage2;
-    const outPorts = router.outLinks.map(l => `${l.iface} → R${l.peerIdx} (${l.ip})`).join(', ') || '—';
-    const inPorts  = router.inLinks.map(l  => `${l.iface} ← R${l.peerIdx} (${l.ip})`).join(', ') || '—';
-    const title    = `Router ${router.idx} — ${router.hosts.toLocaleString()} Hosts — LAN: ${router.lan.netAddr}/${router.lan.cidr}`;
-    const portInfo = `OUT: ${outPorts}  |  IN: ${inPorts}`;
-
-    appendRouterBlock(blocksEl, title, portInfo, stage1, stage2, fullCli, proto);
+    appendRouterBlock(blocksEl, title, ports, s1, s2, fullCli, proto);
   });
 
-  document.getElementById('cliPanel').classList.remove('hidden');
+  document.getElementById('cliPanel')?.classList.remove('hidden');
   setTimeout(() =>
-    document.getElementById('cliPanel').scrollIntoView({ behavior: 'smooth', block: 'start' }),
+    document.getElementById('cliPanel')?.scrollIntoView({ behavior: 'smooth', block: 'start' }),
     60
   );
 }
@@ -1226,7 +911,7 @@ function appendRouterBlock(container, title, portInfo, stage1, stage2, fullCli, 
   block._stage2   = stage2;
   block._label    = title;
 
-  const hdr     = document.createElement('div');
+  const hdr = document.createElement('div');
   hdr.className = 'router-block-header';
   hdr.innerHTML = `
     <div>
@@ -1240,20 +925,20 @@ function appendRouterBlock(container, title, portInfo, stage1, stage2, fullCli, 
     </div>`;
   block.appendChild(hdr);
 
-  const sl1     = document.createElement('div');
+  const sl1 = document.createElement('div');
   sl1.className = 'stage-label s1';
   sl1.textContent = '── Stage 1: Interface Configuration';
   block.appendChild(sl1);
-  const pre1     = document.createElement('div');
+  const pre1 = document.createElement('div');
   pre1.className = 'cli-code';
   pre1.textContent = stage1;
   block.appendChild(pre1);
 
-  const sl2     = document.createElement('div');
+  const sl2 = document.createElement('div');
   sl2.className = 'stage-label s2';
   sl2.textContent = `── Stage 2: ${PROTO_NAMES[proto]} Configuration`;
   block.appendChild(sl2);
-  const pre2     = document.createElement('div');
+  const pre2 = document.createElement('div');
   pre2.className = 'cli-code';
   pre2.textContent = stage2;
   block.appendChild(pre2);
@@ -1262,24 +947,21 @@ function appendRouterBlock(container, title, portInfo, stage1, stage2, fullCli, 
 }
 
 /* ============================================================
-   12. COPY & EXPORT FUNCTIONS
+   12. COPY & EXPORT
    ============================================================ */
 
 function copyBlock(btn) {
   const block = btn.closest('.router-block');
   toClipboard(block._fullCli || '', btn);
 }
-
 function copyStage(btn, stage) {
   const block = btn.closest('.router-block');
   toClipboard(stage === 1 ? (block._stage1 || '') : (block._stage2 || ''), btn);
 }
-
 function copyAllCLI() {
   toClipboard(getAllCLI(), null);
-  alert('All CLI copied to clipboard!');
+  alert('All CLI copied!');
 }
-
 function toClipboard(text, btn) {
   navigator.clipboard.writeText(text).then(() => {
     if (!btn) return;
@@ -1288,27 +970,19 @@ function toClipboard(text, btn) {
     setTimeout(() => { btn.textContent = orig; }, 1500);
   });
 }
-
 function getAllCLI() {
   return Array.from(document.querySelectorAll('#cliBlocks .router-block'))
-    .map(b => {
-      const sep = '! ' + '-'.repeat(60);
-      return `${sep}\n! ${b._label}\n${sep}\n\n${b._fullCli}`;
-    }).join('\n');
+    .map(b => `! ${'-'.repeat(60)}\n! ${b._label}\n! ${'-'.repeat(60)}\n\n${b._fullCli}`)
+    .join('\n');
 }
-
 function exportCLI()     { exportCLIText(); }
-
 function exportCLIText() {
   const base = document.getElementById('base').value.trim().replace(/\./g, '_');
   dlBlob(getAllCLI(), 'text/plain', `VLSM_CLI_${currentProto}_${base}.txt`);
 }
-
 function exportCLIExcel() {
   const base  = document.getElementById('base').value.trim();
-  const proto = PROTO_NAMES[currentProto] || '';
-  const lines = [`${base} - VLSM CLI (${proto})`, '', ' '];
-
+  const lines = [`${base} - VLSM CLI (${PROTO_NAMES[currentProto] || ''})`, '', ' '];
   document.querySelectorAll('#cliBlocks .router-block').forEach(b => {
     lines.push(b._label || '');
     lines.push('--- Stage 1: Interface Configuration ---');
@@ -1317,7 +991,6 @@ function exportCLIExcel() {
     (b._stage2 || '').split('\n').forEach(l => lines.push('\t' + l));
     lines.push('');
   });
-
   dlBlob('\uFEFF' + lines.join('\n'), 'application/vnd.ms-excel;charset=utf-8',
     `VLSM_CLI_${currentProto}_${base.replace(/\./g, '_')}.xls`);
 }
@@ -1328,14 +1001,14 @@ function exportCLIExcel() {
 
 function downloadExcel() {
   const rows = document.querySelectorAll('#vlsmTable tr');
-  if (rows.length <= 1) { alert('Please calculate VLSM first.'); return; }
+  if (rows.length <= 1) { alert('Calculate first.'); return; }
 
   const base = document.getElementById('base').value.trim();
   const topo = topoUsed === 'ring' ? 'Ring' : 'Bus/Linear';
 
   let html = `<html xmlns:o="urn:schemas-microsoft-com:office:office"
-    xmlns:x="urn:schemas-microsoft-com:office:excel"
-    xmlns="http://www.w3.org/TR/REC-html40">
+xmlns:x="urn:schemas-microsoft-com:office:excel"
+xmlns="http://www.w3.org/TR/REC-html40">
 <head><meta charset="UTF-8">
 <!--[if gte mso 9]><xml><x:ExcelWorkbook><x:ExcelWorksheets>
 <x:ExcelWorksheet><x:Name>VLSM</x:Name></x:ExcelWorksheet>
@@ -1352,8 +1025,8 @@ td{padding:7px 16px;border:1px solid #d1d5db;white-space:nowrap;}
 </style></head><body>
 <table>
 <tr><td colspan="13" class="title">${base} — VLSM Routing Table (${topo})</td></tr>
-<tr><td colspan="13" class="sub">Generated: ${new Date().toLocaleString()} · WAN: OUT=firstIP (S0/x/0) · IN=lastIP (S0/x/1)</td></tr>
-<tr><td colspan="13" style="height:4px;background:#f0f9ff;"></td></tr>`;
+<tr><td colspan="13" class="sub">Generated: ${new Date().toLocaleString()}</td></tr>
+<tr><td colspan="13" style="height:4px;"></td></tr>`;
 
   let lanIdx = 0;
   rows.forEach((r, ri) => {
@@ -1379,10 +1052,6 @@ td{padding:7px 16px;border:1px solid #d1d5db;white-space:nowrap;}
     `VLSM_Table_${base.replace(/\./g, '_')}.xls`);
 }
 
-/* ============================================================
-   HELPER: BLOB FILE DOWNLOAD
-   ============================================================ */
-
 function dlBlob(content, type, filename) {
   const blob = new Blob([content], { type });
   const url  = URL.createObjectURL(blob);
@@ -1398,6 +1067,8 @@ function dlBlob(content, type, filename) {
 
 window.addEventListener('DOMContentLoaded', () => {
   const wrap   = document.getElementById('hostBoxes');
+  if (!wrap) return;
+
   const addBtn = document.createElement('button');
   addBtn.className = 'btn-add';
   addBtn.setAttribute('aria-label', 'Add a new router');
@@ -1408,12 +1079,11 @@ window.addEventListener('DOMContentLoaded', () => {
   addBtn.onclick = () => addHostBox();
   wrap.appendChild(addBtn);
 
-  // Default example routers
   [25000, 15000, 10000, 500].forEach(v => addHostBox(v));
   selectTopo('bus');
 });
 
-// Ctrl+Enter keyboard shortcut
+// Ctrl+Enter shortcut
 document.addEventListener('keydown', e => {
   if (e.key === 'Enter' && e.ctrlKey) calculate();
 });

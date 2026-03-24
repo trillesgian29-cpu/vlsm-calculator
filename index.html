@@ -3,304 +3,306 @@
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <meta name="description" content="Offline VLSM Calculator with Cisco IOS CLI Generator — supports Static, RIP v2, OSPF, and EIGRP routing configurations." />
   <title>VLSM Calculator — Cisco CLI Generator</title>
-
-  <!-- Google Fonts -->
   <link rel="preconnect" href="https://fonts.googleapis.com" />
-  <link
-    href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap"
-    rel="stylesheet"
-  />
-   <link rel="apple-touch-icon" sizes="180x180" href="assets/icons/favicon_io/android-chrome-192x192.png">
-   <link rel="icon" type="image/png" sizes="32x32" href="assets/icons/favicon_io/android-chrome-512x512.png">
-   <link rel="icon" type="image/png" sizes="16x16" href="assets/icons/favicon_io/apple-touch-icon.png">
-   
-  <!-- External Stylesheet -->
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet" />
   <link rel="stylesheet" href="style.css" />
 </head>
 <body>
 
-  <!-- ════════════════════════════════════════════════════
-       HEADER / TOPBAR
-  ════════════════════════════════════════════════════ -->
-  <header class="topbar" role="banner">
-    <div class="topbar-logo">
-      <svg viewBox="0 0 28 28" fill="none" aria-hidden="true">
-        <rect width="28" height="28" rx="6" fill="#2563eb"/>
-        <path d="M6 14h16M6 9l6 5-6 5M16 9l6 5-6 5"
-              stroke="white" stroke-width="2"
-              stroke-linecap="round" stroke-linejoin="round"/>
-      </svg>
-      <span class="topbar-title">VLSM Calculator-Gian</span>
+<!-- ══ TOPBAR ═══════════════════════════════════════════════ -->
+<header class="topbar">
+  <div class="topbar-logo">
+    <div class="topbar-logo-icon">⬡</div>
+    <span class="topbar-title">NetCalc Pro</span>
+  </div>
+  <div class="topbar-sep"></div>
+  <span class="topbar-sub">VLSM · FLSM · Cisco CLI</span>
+  <div class="topbar-right">
+    <div class="status-badge">
+      <div class="status-dot"></div>
+      OFFLINE
     </div>
-    <div class="topbar-sep" role="separator"></div>
-    <span class="topbar-sub">Cisco CLI Generator</span>
-    <div class="topbar-right">
-      <span class="topbar-badge" title="Works without internet connection">OFFLINE</span>
-    </div>
-  </header>
+  </div>
+</header>
 
-  <!-- ════════════════════════════════════════════════════
-       MAIN CONTENT
-  ════════════════════════════════════════════════════ -->
-  <main class="main" id="app">
+<!-- ══ NAV TABS ══════════════════════════════════════════════ -->
+<nav class="nav-tabs">
+  <button class="nav-tab active" onclick="showSection('calcSection', this)">
+    📐 Subnet Calculator
+  </button>
+  <button class="nav-tab" onclick="showSection('cliSection', this)">
+    🖥 CLI Generator
+  </button>
+  <button class="nav-tab" onclick="showSection('cheatSection', this)">
+    📋 Cheat Sheet
+  </button>
+</nav>
 
-    <!-- ── SECTION 1: INPUT PANEL ─────────────────────────── -->
-    <section class="card" id="inputCard" aria-label="VLSM Input">
+<!-- ══ MAIN ══════════════════════════════════════════════════ -->
+<main class="main">
+
+  <!-- ══ SECTION 1: SUBNET CALCULATOR ═══════════════════════ -->
+  <section id="calcSection" class="section active">
+
+    <!-- Input Card -->
+    <div class="card">
       <div class="card-header">
-        <div class="card-header-icon icon-blue" aria-hidden="true">⚙</div>
-        <div class="card-header-text">
-          <h2>VLSM Input</h2>
-          <p>Enter base network and host requirements per router</p>
+        <div class="card-header-icon icon-blue">⚙</div>
+        <div>
+          <h2>Subnet Calculator</h2>
+          <p>FLSM — Fixed Length &nbsp;|&nbsp; VLSM — Variable Length</p>
         </div>
       </div>
-
       <div class="card-body">
-        <div class="form-grid">
 
-          <!-- Base Network IP -->
-          <div class="field">
-            <label class="field-label" for="base">Base Network</label>
-            <input
-              type="text"
-              id="base"
-              value="172.168.0.0"
-              placeholder="e.g. 192.168.1.0"
-              spellcheck="false"
-              autocomplete="off"
-            />
-            <span class="field-hint">Starting IP address for VLSM allocation</span>
-          </div>
-
-          <!-- Host Requirements -->
-          <div class="field">
-            <label class="field-label">Host Requirements — one box per router</label>
-            <div class="host-wrap" id="hostBoxes" role="list" aria-label="Router host inputs"></div>
-          </div>
-
+        <div class="mode-tabs">
+          <button class="mode-tab" data-mode="flsm" onclick="setMode('flsm')">FLSM</button>
+          <button class="mode-tab active" data-mode="vlsm" onclick="setMode('vlsm')">VLSM</button>
         </div>
 
-        <!-- Topology Selector -->
-        <div class="topo-section">
-          <label class="field-label topo-main-label">Router Topology</label>
-
-          <div class="topo-row" role="radiogroup" aria-label="Select router topology">
-
-            <!-- Bus / Linear -->
-            <div
-              class="topo-card active"
-              id="topo-bus"
-              role="radio"
-              aria-checked="true"
-              tabindex="0"
-              onclick="selectTopo('bus')"
-              onkeypress="if(event.key==='Enter'||event.key===' ')selectTopo('bus')"
-            >
-              <div class="topo-check" aria-hidden="true">
-                <div class="topo-check-dot"></div>
-              </div>
-              <div class="topo-visual" aria-hidden="true">
-                <svg class="topo-svg" viewBox="0 0 180 44" aria-hidden="true">
-                  <line x1="30" y1="22" x2="150" y2="22" stroke="#30363d" stroke-width="2"/>
-                  <circle cx="30"  cy="22" r="10" fill="#1c2b3a" stroke="#2563eb" stroke-width="2"/>
-                  <circle cx="70"  cy="22" r="10" fill="#1c2b3a" stroke="#2563eb" stroke-width="2"/>
-                  <circle cx="110" cy="22" r="10" fill="#1c2b3a" stroke="#2563eb" stroke-width="2"/>
-                  <circle cx="150" cy="22" r="10" fill="#1c2b3a" stroke="#2563eb" stroke-width="2"/>
-                  <text x="30"  y="26" text-anchor="middle" fill="#60a5fa" font-size="9" font-family="monospace">R1</text>
-                  <text x="70"  y="26" text-anchor="middle" fill="#60a5fa" font-size="9" font-family="monospace">R2</text>
-                  <text x="110" y="26" text-anchor="middle" fill="#60a5fa" font-size="9" font-family="monospace">R3</text>
-                  <text x="150" y="26" text-anchor="middle" fill="#60a5fa" font-size="9" font-family="monospace">R4</text>
-                </svg>
-              </div>
-              <div class="topo-name">Bus / Linear</div>
-              <div class="topo-desc">Routers connected in a chain. Last router has no return link.</div>
-              <span class="topo-formula">WAN links = N − 1</span>
+        <!-- FLSM Inputs -->
+        <div id="flsmInputs" class="hidden">
+          <div class="form-row">
+            <div class="field">
+              <label class="field-label">Network Address</label>
+              <input type="text" id="flsmNet" placeholder="e.g. 192.168.1.0" style="width:180px;" />
             </div>
-
-            <!-- Ring -->
-            <div
-              class="topo-card"
-              id="topo-ring"
-              role="radio"
-              aria-checked="false"
-              tabindex="0"
-              onclick="selectTopo('ring')"
-              onkeypress="if(event.key==='Enter'||event.key===' ')selectTopo('ring')"
-            >
-              <div class="topo-check" aria-hidden="true">
-                <div class="topo-check-dot"></div>
-              </div>
-              <div class="topo-visual" aria-hidden="true">
-                <svg class="topo-svg" viewBox="0 0 180 44" aria-hidden="true">
-                  <line x1="90" y1="12" x2="160" y2="32" stroke="#30363d" stroke-width="2"/>
-                  <line x1="160" y1="32" x2="20"  y2="32" stroke="#30363d" stroke-width="2"/>
-                  <line x1="20"  y1="32" x2="90"  y2="12" stroke="#30363d" stroke-width="2"/>
-                  <circle cx="90"  cy="12" r="10" fill="#1c2b3a" stroke="#22c55e" stroke-width="2"/>
-                  <circle cx="160" cy="32" r="10" fill="#1c2b3a" stroke="#22c55e" stroke-width="2"/>
-                  <circle cx="20"  cy="32" r="10" fill="#1c2b3a" stroke="#22c55e" stroke-width="2"/>
-                  <text x="90"  y="16" text-anchor="middle" fill="#4ade80" font-size="9" font-family="monospace">R1</text>
-                  <text x="160" y="36" text-anchor="middle" fill="#4ade80" font-size="9" font-family="monospace">R2</text>
-                  <text x="20"  y="36" text-anchor="middle" fill="#4ade80" font-size="9" font-family="monospace">R3</text>
-                </svg>
-              </div>
-              <div class="topo-name">Ring</div>
-              <div class="topo-desc">Routers form a closed loop. Last router links back to first.</div>
-              <span class="topo-formula">WAN links = N</span>
+            <div class="field">
+              <label class="field-label">Subnet Mask / Prefix</label>
+              <input type="text" id="flsmMask" placeholder="e.g. 24 or /24 or 255.255.255.0" style="width:220px;" />
             </div>
-
+            <div class="field">
+              <label class="field-label">Number of Subnets</label>
+              <input type="number" id="flsmCount" placeholder="e.g. 4" min="1" style="width:130px;" />
+            </div>
           </div>
-
-          <!-- WAN Preview -->
-          <div class="wan-preview hidden" id="wanPreview" aria-live="polite">
-            <div class="wan-preview-label">Auto-generated /30 WAN links</div>
-            <div class="wan-tags" id="wanTags"></div>
-          </div>
-          <div class="topo-info hidden" id="topoInfo" aria-live="polite"></div>
         </div>
 
-        <!-- Action Buttons -->
+        <!-- VLSM Inputs -->
+        <div id="vlsmInputs">
+          <div class="form-row">
+            <div class="field">
+              <label class="field-label">Base Network Address</label>
+              <input type="text" id="vlsmNet" placeholder="e.g. 192.168.10.0" style="width:200px;" />
+            </div>
+          </div>
+          <div class="section-title">Host Requirements — sorted automatically</div>
+          <div id="vlsmList" style="margin-bottom:10px;"></div>
+          <button class="btn btn-ghost" onclick="addVlsmEntry()" style="font-size:12px;">
+            + Add Subnet
+          </button>
+        </div>
+
         <div class="btn-row">
-          <button class="btn btn-primary" id="btnCalculate" onclick="calculate()">
-            <svg width="14" height="14" viewBox="0 0 16 16" fill="none" aria-hidden="true">
-              <path d="M8 1v14M1 8h14" stroke="white" stroke-width="2" stroke-linecap="round"/>
-            </svg>
-            Calculate VLSM
-          </button>
-          <button class="btn btn-success" id="btnExportTable" onclick="downloadExcel()">
-            <svg width="14" height="14" viewBox="0 0 16 16" fill="none" aria-hidden="true">
-              <path d="M8 1v10M4 7l4 4 4-4M2 14h12" stroke="white" stroke-width="2"
-                    stroke-linecap="round" stroke-linejoin="round"/>
-            </svg>
-            Export Table
-          </button>
-          <button class="btn btn-ghost" onclick="clearAll()">Clear</button>
+          <button class="btn btn-primary" onclick="calculate()">▶ Calculate</button>
+          <button class="btn btn-ghost" onclick="resetCalc()">↺ Reset</button>
         </div>
-
-        <!-- Error Message -->
-        <div id="error" role="alert" aria-live="assertive"></div>
+        <div id="calcError" class="error-msg"></div>
       </div>
-    </section>
+    </div>
 
-    <!-- ── SECTION 2: VLSM TABLE ──────────────────────────── -->
-    <section class="card hidden" id="tableCard" aria-label="VLSM Routing Table">
-      <div class="card-header">
-        <div class="card-header-icon icon-orange" aria-hidden="true">📋</div>
-        <div class="card-header-text">
-          <h2>VLSM Routing Table</h2>
-          <p id="tableSubtitle">—</p>
-        </div>
-      </div>
-
+    <!-- Result Table Card -->
+    <div class="card hidden" id="resultCard">
+      <div class="table-info-row" id="tableInfoRow"></div>
       <div class="table-wrap">
-        <table class="vlsm-table" id="vlsmTable" aria-label="VLSM subnet allocation results">
+        <table class="subnet-table">
           <thead>
             <tr>
-              <th scope="col">#</th>
-              <th scope="col">Type</th>
-              <th scope="col">Label</th>
-              <th scope="col">Hosts Req.</th>
-              <th scope="col">Usable</th>
-              <th scope="col">CIDR</th>
-              <th scope="col">Octet</th>
-              <th scope="col">Increment</th>
-              <th scope="col">Network Address</th>
-              <th scope="col">Subnet Mask</th>
-              <th scope="col">1st Usable</th>
-              <th scope="col">Last Usable</th>
-              <th scope="col">Broadcast</th>
-              </tr>
+              <th class="col-no">#</th>
+              <th>Hosts Req.</th>
+              <th>CIDR</th>
+              <th>Octet</th>
+              <th>Increment</th>
+              <th>Network Address</th>
+              <th>Subnet Mask</th>
+              <th>1st Usable</th>
+              <th>Last Usable</th>
+              <th>Broadcast</th>
+            </tr>
           </thead>
-          <tbody id="vlsmBody"></tbody>
+          <tbody id="subnetTbody"></tbody>
         </table>
       </div>
+      <div class="table-actions">
+        <button class="btn btn-success" onclick="exportXLSX()">⬇ Export Excel</button>
+      </div>
+    </div>
 
-      <div class="summary-row" id="summaryRow" aria-label="Summary statistics"></div>
-    </section>
+  </section>
 
-    <!-- ── SECTION 3: ROUTING CONFIGURATION GENERATOR ─────── -->
-    <section class="card hidden" id="routingCard" aria-label="Routing Configuration Generator">
+  <!-- ══ SECTION 2: CLI GENERATOR ════════════════════════════ -->
+  <section id="cliSection" class="section">
+
+    <div class="card">
       <div class="card-header">
-        <div class="card-header-icon icon-purple" aria-hidden="true">🖥</div>
-        <div class="card-header-text">
+        <div class="card-header-icon icon-purple">🖥</div>
+        <div>
           <h2>Routing Configuration Generator</h2>
-          <p>Select a protocol to generate Cisco IOS CLI commands</p>
+          <p>Generates Cisco IOS CLI — paste directly into Packet Tracer</p>
         </div>
       </div>
-
       <div class="card-body">
-        <div class="proto-grid" role="group" aria-label="Routing protocol selection">
 
-          <button class="proto-btn pb-static" id="pb-static" onclick="generateCLI('static')"
-                  aria-label="Generate Static Routing configuration">
-            <div class="proto-btn-icon" aria-hidden="true">🔗</div>
-            <div class="proto-btn-label">Static</div>
-            <div class="proto-btn-desc">Manual ip route commands per router</div>
-          </button>
+        <!-- Locked state -->
+        <div id="cliLocked">
+          <div class="cli-locked">
+            <div class="cli-locked-icon">🔒</div>
+            <h3>No subnets calculated</h3>
+            <p>Go to the Subnet Calculator tab and calculate subnets first.</p>
+          </div>
+        </div>
 
-          <button class="proto-btn pb-rip" id="pb-rip" onclick="generateCLI('rip')"
-                  aria-label="Generate RIP v2 configuration">
-            <div class="proto-btn-icon" aria-hidden="true">📡</div>
-            <div class="proto-btn-label">RIP v2</div>
-            <div class="proto-btn-desc">Distance-vector, classless updates</div>
-          </button>
+        <!-- Unlocked content -->
+        <div id="cliContent" class="hidden">
 
-          <button class="proto-btn pb-ospf" id="pb-ospf" onclick="generateCLI('ospf')"
-                  aria-label="Generate OSPF configuration">
-            <div class="proto-btn-icon" aria-hidden="true">🔷</div>
-            <div class="proto-btn-label">OSPF</div>
-            <div class="proto-btn-desc">Link-state, area 0 configuration</div>
-          </button>
+          <!-- Topology -->
+          <div class="section-title">Router Topology</div>
+          <div class="topo-row">
+            <button class="topo-btn active" id="topoRing" onclick="setTopo('ring')">
+              🔄 Ring
+              <span style="font-size:10px;color:var(--text3);">(N links)</span>
+            </button>
+            <button class="topo-btn" id="topoBus" onclick="setTopo('bus')">
+              ➡ Bus / Linear
+              <span style="font-size:10px;color:var(--text3);">(N−1 links)</span>
+            </button>
+          </div>
 
-          <button class="proto-btn pb-eigrp" id="pb-eigrp" onclick="generateCLI('eigrp')"
-                  aria-label="Generate EIGRP configuration">
-            <div class="proto-btn-icon" aria-hidden="true">⚡</div>
-            <div class="proto-btn-label">EIGRP</div>
-            <div class="proto-btn-desc">Hybrid, AS 100 with wildcard masks</div>
-          </button>
+          <!-- Protocol -->
+          <div class="section-title">Routing Protocol</div>
+          <div class="proto-row">
+            <button class="proto-btn pb-static active" data-proto="static" onclick="setProto('static')">
+              <div class="proto-btn-icon">🔗</div>
+              <div class="proto-btn-label">Static</div>
+            </button>
+            <button class="proto-btn pb-rip" data-proto="rip" onclick="setProto('rip')">
+              <div class="proto-btn-icon">📡</div>
+              <div class="proto-btn-label">RIP v2</div>
+            </button>
+            <button class="proto-btn pb-eigrp" data-proto="eigrp" onclick="setProto('eigrp')">
+              <div class="proto-btn-icon">⚡</div>
+              <div class="proto-btn-label">EIGRP</div>
+            </button>
+            <button class="proto-btn pb-ospf" data-proto="ospf" onclick="setProto('ospf')">
+              <div class="proto-btn-icon">🔷</div>
+              <div class="proto-btn-label">OSPF</div>
+            </button>
+          </div>
 
+          <!-- Protocol extra fields -->
+          <div id="eigrpAsField" class="proto-extra-field hidden">
+            <label class="field-label">EIGRP AS Number:</label>
+            <input type="number" id="eigrpAs" value="100" min="1" max="65535" />
+          </div>
+          <div id="ospfPidField" class="proto-extra-field hidden">
+            <label class="field-label">OSPF Process ID:</label>
+            <input type="number" id="ospfPid" value="1" min="1" />
+          </div>
+
+          <!-- Router Management -->
+          <div class="section-title">Router Management</div>
+          <div class="router-controls">
+            <button class="btn btn-primary" onclick="addRouter()">+ Add Router</button>
+            <button class="btn btn-danger-outline" onclick="removeLastRouter()">− Remove Last</button>
+            <span class="router-count" id="routerCountBadge">0 Routers</span>
+          </div>
+          <div id="routerAssignGrid" class="router-assign-grid"></div>
+
+          <!-- Serial Links -->
+          <div class="section-title">Serial Links (WAN)</div>
+          <div id="serialHint" class="serial-hint">Add at least 2 routers to see serial links.</div>
+          <div id="serialList" style="margin-bottom:14px;"></div>
+
+          <!-- Generate -->
+          <div class="btn-row">
+            <button class="btn btn-primary" onclick="generateCLI()">▶ Generate CLI</button>
+            <button class="btn btn-ghost" onclick="resetCLI()">↺ Reset</button>
+          </div>
+          <div id="cliError" class="error-msg"></div>
         </div>
       </div>
-    </section>
+    </div>
 
-    <!-- ── SECTION 4: CLI OUTPUT TERMINAL ────────────────── -->
-    <section class="cli-panel hidden" id="cliPanel" aria-label="CLI Output Terminal">
-
-      <!-- Terminal Title Bar -->
-      <div class="cli-titlebar">
-        <div class="cli-dots" aria-hidden="true">
-          <div class="cli-dot dot-red"></div>
-          <div class="cli-dot dot-yellow"></div>
-          <div class="cli-dot dot-green"></div>
+    <!-- CLI Output -->
+    <div id="cliOutputSection" class="hidden">
+      <div class="card">
+        <div class="card-header">
+          <div class="card-header-icon icon-green">📟</div>
+          <div>
+            <h2>CLI Output</h2>
+            <p>Stage 1: Interface Configuration &nbsp;·&nbsp; Stage 2: Routing Protocol</p>
+          </div>
         </div>
-        <span class="cli-titlebar-text" id="cliTitleText">cisco-ios — terminal</span>
+        <div class="card-body" id="cliOutputs"></div>
       </div>
+    </div>
 
-      <!-- Terminal Toolbar -->
-      <div class="cli-toolbar">
-        <span id="cliProtoBadge" aria-live="polite"></span>
-        <div class="cli-toolbar-right">
-          <button class="cli-btn cli-btn-copy" onclick="copyAllCLI()" title="Copy all routers CLI">
-            ⎘ Copy All
-          </button>
-          <button class="cli-btn" onclick="exportCLIText()" title="Export as plain text file">
-            ↓ Export .txt
-          </button>
-          <button class="cli-btn" onclick="exportCLIExcel()" title="Export as Excel file">
-            ↓ Export .xls
-          </button>
+  </section>
+
+  <!-- ══ SECTION 3: CHEAT SHEET ══════════════════════════════ -->
+  <section id="cheatSection" class="section">
+    <div class="card">
+      <div class="card-header">
+        <div class="card-header-icon icon-orange">📋</div>
+        <div>
+          <h2>Subnetting Cheat Sheet</h2>
+          <p>2ⁿ formula · CIDR · Subnet Masks · Increments</p>
         </div>
       </div>
+      <div class="table-wrap">
+        <table class="cheat-table">
+          <thead>
+            <tr>
+              <th>2ⁿ</th>
+              <th>Total Hosts</th>
+              <th>Increment</th>
+              <th>CIDR</th>
+              <th>Subnet Mask</th>
+            </tr>
+          </thead>
+          <tbody id="cheatTbody"></tbody>
+        </table>
+      </div>
+    </div>
+  </section>
 
-      <!-- Router CLI Blocks (populated by JS) -->
-      <div class="cli-routers" id="cliBlocks" aria-live="polite"></div>
+</main>
 
-    </section>
+<script>
+// Router count badge update
+const origAdd    = window.addRouter;
+const origRemove = window.removeLastRouter;
+function updateRouterBadge() {
+  const badge = document.getElementById('routerCountBadge');
+  if (badge) badge.textContent = routers.length + ' Router' + (routers.length !== 1 ? 's' : '');
+}
+</script>
+<script src="script.js" defer></script>
+<script>
+// Section navigation
+function showSection(id, btn) {
+  document.querySelectorAll('.section').forEach(s => s.classList.remove('active'));
+  document.querySelectorAll('.nav-tab').forEach(b => b.classList.remove('active'));
+  document.getElementById(id).classList.add('active');
+  btn.classList.add('active');
+}
 
-  </main>
-
-  <!-- External JavaScript (deferred) -->
-  <script src="script.js" defer></script>
-
+// Patch addRouter/removeLastRouter to update badge
+document.addEventListener('DOMContentLoaded', () => {
+  const origAddR = window.addRouter;
+  const origRemR = window.removeLastRouter;
+  window.addRouter = function() {
+    if (origAddR) origAddR();
+    const b = document.getElementById('routerCountBadge');
+    if (b) b.textContent = routers.length + ' Router' + (routers.length !== 1 ? 's' : '');
+  };
+  window.removeLastRouter = function() {
+    if (origRemR) origRemR();
+    const b = document.getElementById('routerCountBadge');
+    if (b) b.textContent = routers.length + ' Router' + (routers.length !== 1 ? 's' : '');
+  };
+});
+</script>
 </body>
 </html>

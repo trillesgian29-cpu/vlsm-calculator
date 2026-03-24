@@ -1,1247 +1,802 @@
-/**
- * VLSM Calculator — script.js
- * ============================================================
- * Offline VLSM Calculator with Cisco IOS CLI Generator
- *
- * STRICT PORT ASSIGNMENT RULE (Cisco Convention):
- * ─────────────────────────────────────────────────
- *  Every WAN link is DIRECTIONAL:  RouterA → RouterB
- *
- *  RouterA side = OUT  →  Serial0/1/0  →  firstIP  of /30
- *  RouterB side = IN   →  Serial0/1/1  →  lastIP   of /30
- *
- *  Multiple links per router (ring topology):
- *    1st OUT link  →  Serial0/1/0
- *    2nd OUT link  →  Serial0/2/0   (ring closing link)
- *    1st IN  link  →  Serial0/1/1
- *    2nd IN  link  →  Serial0/2/1
- *
- *  This guarantees:
- *    ✔  Every link has exactly 1 OUT and 1 IN port
- *    ✔  No OUT↔OUT or IN↔IN conflicts
- *    ✔  firstIP always goes to OUT side
- *    ✔  lastIP  always goes to IN  side
- *
- * Modules:
- *  1.  IP Utility Functions
- *  2.  CIDR Reference Table
- *  3.  Host Input Box Management
- *  4.  Topology Selection & WAN Link Generation
- *  5.  Core VLSM Calculation
- *  6.  Table Renderer
- *  7.  Router Object Builder (strict direction-aware)
- *  8.  Visual Connection Map
- *  9.  Next-Hop Resolver (BFS)
- *  10. Cisco IOS CLI Builders — Stage 1 & 2
- *  11. CLI Renderer
- *  12. Copy & Export
- *  13. Excel Table Export
- *  14. Initialisation
- * ============================================================
- */
+/* ============================================================
+   VLSM / FLSM Calculator + Routing CLI Generator
+   script.js
+   ============================================================ */
 
 'use strict';
 
-/* ============================================================
-   1. IP UTILITY FUNCTIONS
-   ============================================================ */
+// ============================================================
+//  STATE
+// ============================================================
+let mode = 'vlsm';
+let topo = 'ring';
+let proto = 'static';
+let subnetData = [];
+let routers = [];
+let serialLinks = [];
+let routerCount = 0;
 
+// ============================================================
+//  IP MATH
+// ============================================================
 function ipToInt(ip) {
-  return ip.trim().split('.').reduce((a, v) => (a * 256) + parseInt(v, 10), 0) >>> 0;
+  return ip.split('.').reduce((acc, o) => (acc << 8) + parseInt(o), 0) >>> 0;
 }
-
 function intToIp(n) {
-  n = n >>> 0;
   return [(n >>> 24) & 255, (n >>> 16) & 255, (n >>> 8) & 255, n & 255].join('.');
 }
+function prefixToMask(prefix) {
+  if (prefix === 0) return 0;
+  const shift = 32 - prefix;
+  return shift >= 32 ? 0 : (0xffffffff << shift) >>> 0;
+}
+function maskToPrefix(maskInt) {
+  let n = maskInt, count = 0;
+  while (n & 0x80000000) { count++; n = (n << 1) >>> 0; }
+  return count;
+}
+function parseMaskInput(val) {
+  val = val.trim();
+  if (val.startsWith('/')) val = val.slice(1);
+  if (/^\d+$/.test(val)) {
+    const p = parseInt(val);
+    if (p < 0 || p > 32) throw new Error('Prefix must be 0-32');
+    return p;
+  }
+  if (val.includes('.')) return maskToPrefix(ipToInt(val));
+  throw new Error('Invalid mask/prefix');
+}
+function wildcardMask(maskInt) { return (~maskInt) >>> 0; }
 
-/** Wildcard mask — bitwise NOT of subnet mask. Used by OSPF/EIGRP. */
-function wildcardOf(mask) {
-  return intToIp((~ipToInt(mask)) >>> 0);
+// Class A serial networks pool
+const classANets = (function () {
+  const nets = [];
+  for (let i = 10; i <= 20; i++) {
+    const networkInt = ipToInt(i + '.0.0.0');
+    const maskInt = 0xff000000 >>> 0;
+    nets.push({
+      no: 'A' + i, hosts: 16777214, cidr: '/8',
+      octet: '1st', increment: 256, blockSize: 16777216,
+      networkId: i + '.0.0.0', mask: '255.0.0.0',
+      first: i + '.0.0.1', second: i + '.0.0.2',
+      last: i + '.255.255.254', broadcast: i + '.255.255.255',
+      networkInt, maskInt, prefix: 8
+    });
+  }
+  return nets;
+})();
+
+function getSerialNet(link) {
+  if (link.classAIndex !== -1) return classANets[link.classAIndex];
+  if (link.netIndex !== -1) return subnetData[link.netIndex];
+  return null;
 }
 
-/** Classful network for RIP v2. Class A ≤127 → /8, Class B ≤191 → /16, C → /24 */
-function classfulNet(ip) {
-  const n = ipToInt(ip), f = (n >>> 24) & 255;
-  if (f <= 127) return intToIp(n & 0xFF000000);
-  if (f <= 191) return intToIp(n & 0xFFFF0000);
-  return intToIp(n & 0xFFFFFF00);
+function getOctetLabel(prefix) {
+  if (prefix >= 25) return '4th';
+  if (prefix >= 17) return '3rd';
+  if (prefix >= 9)  return '2nd';
+  return '1st';
 }
 
-/* ============================================================
-   2. CIDR REFERENCE TABLE
-   ============================================================ */
+function getOctetIncrement(prefix) {
+  if (prefix >= 25) return Math.pow(2, 32 - prefix);
+  if (prefix >= 17) return Math.pow(2, 24 - prefix);
+  if (prefix >= 9)  return Math.pow(2, 16 - prefix);
+  return Math.pow(2, 8 - prefix);
+}
 
-const CIDR_TABLE = [
-  { cidr: 30, block: 4,        usable: 2,        incr: 4,   mask: '255.255.255.252', octet: '4th' },
-  { cidr: 29, block: 8,        usable: 6,        incr: 8,   mask: '255.255.255.248', octet: '4th' },
-  { cidr: 28, block: 16,       usable: 14,       incr: 16,  mask: '255.255.255.240', octet: '4th' },
-  { cidr: 27, block: 32,       usable: 30,       incr: 32,  mask: '255.255.255.224', octet: '4th' },
-  { cidr: 26, block: 64,       usable: 62,       incr: 64,  mask: '255.255.255.192', octet: '4th' },
-  { cidr: 25, block: 128,      usable: 126,      incr: 128, mask: '255.255.255.128', octet: '4th' },
-  { cidr: 24, block: 256,      usable: 254,      incr: 1,   mask: '255.255.255.0',   octet: '3rd' },
-  { cidr: 23, block: 512,      usable: 510,      incr: 2,   mask: '255.255.254.0',   octet: '3rd' },
-  { cidr: 22, block: 1024,     usable: 1022,     incr: 4,   mask: '255.255.252.0',   octet: '3rd' },
-  { cidr: 21, block: 2048,     usable: 2046,     incr: 8,   mask: '255.255.248.0',   octet: '3rd' },
-  { cidr: 20, block: 4096,     usable: 4094,     incr: 16,  mask: '255.255.240.0',   octet: '3rd' },
-  { cidr: 19, block: 8192,     usable: 8190,     incr: 32,  mask: '255.255.224.0',   octet: '3rd' },
-  { cidr: 18, block: 16384,    usable: 16382,    incr: 64,  mask: '255.255.192.0',   octet: '3rd' },
-  { cidr: 17, block: 32768,    usable: 32766,    incr: 128, mask: '255.255.128.0',   octet: '3rd' },
-  { cidr: 16, block: 65536,    usable: 65534,    incr: 1,   mask: '255.255.0.0',     octet: '2nd' },
-  { cidr: 15, block: 131072,   usable: 131070,   incr: 2,   mask: '255.254.0.0',     octet: '2nd' },
-  { cidr: 14, block: 262144,   usable: 262142,   incr: 4,   mask: '255.252.0.0',     octet: '2nd' },
-  { cidr: 13, block: 524288,   usable: 524286,   incr: 8,   mask: '255.248.0.0',     octet: '2nd' },
-  { cidr: 12, block: 1048576,  usable: 1048574,  incr: 16,  mask: '255.240.0.0',     octet: '2nd' },
-  { cidr: 11, block: 2097152,  usable: 2097150,  incr: 32,  mask: '255.224.0.0',     octet: '2nd' },
-  { cidr: 10, block: 4194304,  usable: 4194302,  incr: 64,  mask: '255.192.0.0',     octet: '2nd' },
-  { cidr:  9, block: 8388608,  usable: 8388606,  incr: 128, mask: '255.128.0.0',     octet: '2nd' },
-  { cidr:  8, block: 16777216, usable: 16777214, incr: 1,   mask: '255.0.0.0',       octet: '1st' },
+function buildSubnetRow(no, networkInt, prefix, inputHosts) {
+  const maskInt = prefixToMask(prefix);
+  const blockSize = prefix === 32 ? 1 : Math.pow(2, 32 - prefix);
+  const calcHosts = prefix >= 31 ? (prefix === 31 ? 2 : 1) : blockSize - 2;
+  const broadcastInt = (networkInt | wildcardMask(maskInt)) >>> 0;
+  const firstInt = prefix >= 31 ? networkInt : networkInt + 1;
+  const secondInt = prefix >= 31 ? networkInt : networkInt + 2;
+  const lastInt = prefix >= 31 ? broadcastInt : broadcastInt - 1;
+  return {
+    no,
+    hosts: inputHosts != null ? inputHosts : (calcHosts < 0 ? 0 : calcHosts),
+    cidr: '/' + prefix,
+    octet: getOctetLabel(prefix),
+    increment: getOctetIncrement(prefix),
+    blockSize,
+    networkId: intToIp(networkInt),
+    mask: intToIp(maskInt),
+    first: intToIp(firstInt),
+    second: intToIp(secondInt),
+    last: intToIp(lastInt),
+    broadcast: intToIp(broadcastInt),
+    networkInt, prefix, maskInt
+  };
+}
+
+// ============================================================
+//  MODE TOGGLE
+// ============================================================
+function setMode(m) {
+  mode = m;
+  document.querySelectorAll('.mode-tab').forEach(b => {
+    b.classList.toggle('active', b.dataset.mode === m);
+  });
+  document.getElementById('flsmInputs').classList.toggle('hidden', m !== 'flsm');
+  document.getElementById('vlsmInputs').classList.toggle('hidden', m !== 'vlsm');
+  document.getElementById('calcError').textContent = '';
+  if (m === 'vlsm' && document.getElementById('vlsmList').children.length === 0) {
+    addVlsmEntry(); addVlsmEntry();
+  }
+}
+
+// ============================================================
+//  VLSM ENTRIES
+// ============================================================
+let vlsmEntryCount = 0;
+function addVlsmEntry() {
+  vlsmEntryCount++;
+  const id = 'vlsm_' + vlsmEntryCount;
+  const div = document.createElement('div');
+  div.className = 'vlsm-entry';
+  div.id = id;
+  div.innerHTML = `
+    <span class="vlsm-label">Subnet ${vlsmEntryCount}</span>
+    <input type="number" placeholder="Required Hosts" min="1">
+    <button class="btn-icon-danger" onclick="removeVlsmEntry('${id}')">✕</button>
+  `;
+  document.getElementById('vlsmList').appendChild(div);
+}
+
+function removeVlsmEntry(id) {
+  document.getElementById(id)?.remove();
+  renumberVlsm();
+}
+
+function renumberVlsm() {
+  document.querySelectorAll('.vlsm-entry .vlsm-label').forEach((e, i) => {
+    e.textContent = 'Subnet ' + (i + 1);
+  });
+}
+
+// ============================================================
+//  CALCULATE
+// ============================================================
+function calculate() {
+  const errEl = document.getElementById('calcError');
+  errEl.textContent = '';
+  try {
+    if (mode === 'flsm') calcFLSM();
+    else calcVLSM();
+  } catch (e) {
+    errEl.textContent = '⚠ ' + e.message;
+  }
+}
+
+function calcFLSM() {
+  const netStr   = document.getElementById('flsmNet').value.trim();
+  const maskStr  = document.getElementById('flsmMask').value.trim();
+  const countStr = document.getElementById('flsmCount').value.trim();
+  if (!netStr || !maskStr || !countStr) throw new Error('Fill all fields');
+  const baseNet = ipToInt(netStr);
+  const prefix  = parseMaskInput(maskStr);
+  const count   = parseInt(countStr);
+  if (isNaN(count) || count < 1) throw new Error('Subnet count must be ≥ 1');
+  let subnetBits = 0;
+  while ((1 << subnetBits) < count) subnetBits++;
+  const newPrefix = prefix + subnetBits;
+  if (newPrefix > 30) throw new Error('Not enough address space for ' + count + ' subnets');
+  subnetData = [];
+  for (let i = 0; i < count; i++) {
+    const inc = Math.pow(2, 32 - newPrefix);
+    subnetData.push(buildSubnetRow(i + 1, (baseNet + i * inc) >>> 0, newPrefix, null));
+  }
+  renderTable(netStr + ' /' + prefix + ' — FLSM');
+}
+
+function calcVLSM() {
+  const netStr = document.getElementById('vlsmNet').value.trim();
+  if (!netStr) throw new Error('Enter a network address');
+  const entries = document.querySelectorAll('#vlsmList .vlsm-entry');
+  if (entries.length === 0) throw new Error('Add at least one subnet');
+  let requirements = [];
+  entries.forEach((e, i) => {
+    const h = parseInt(e.querySelector('input').value);
+    if (isNaN(h) || h < 1) throw new Error('Subnet ' + (i + 1) + ': enter a valid host count');
+    requirements.push(h);
+  });
+  requirements.sort((a, b) => b - a);
+  let cursor = ipToInt(netStr);
+  subnetData = [];
+  for (let i = 0; i < requirements.length; i++) {
+    let p = 30;
+    while (p >= 1) {
+      if (Math.pow(2, 32 - p) - 2 >= requirements[i]) break;
+      p--;
+    }
+    if (p < 1) throw new Error('Cannot fit ' + requirements[i] + ' hosts');
+    subnetData.push(buildSubnetRow(i + 1, cursor, p, requirements[i]));
+    cursor = (cursor + Math.pow(2, 32 - p)) >>> 0;
+  }
+  renderTable(netStr + ' — VLSM');
+}
+
+function renderTable(title) {
+  const last    = subnetData[subnetData.length - 1];
+  const nextInt = (last.networkInt + last.blockSize) >>> 0;
+  const nextAddr = intToIp(nextInt);
+
+  document.getElementById('tableInfoRow').innerHTML =
+    `<span>${title}</span>
+     <span class="next-label">Next Available:</span>
+     <span class="next-addr">${nextAddr}</span>`;
+
+  const tbody = document.getElementById('subnetTbody');
+  tbody.innerHTML = '';
+  subnetData.forEach(s => {
+    const tr = document.createElement('tr');
+    tr.innerHTML = `
+      <td class="col-no">${s.no}</td>
+      <td>${s.hosts.toLocaleString()}</td>
+      <td class="col-cidr">${s.cidr}</td>
+      <td class="col-octet">${s.octet}</td>
+      <td class="col-inc">${s.increment}</td>
+      <td class="col-network">${s.networkId}</td>
+      <td>${s.mask}</td>
+      <td>${s.first}</td>
+      <td>${s.last}</td>
+      <td>${s.broadcast}</td>`;
+    tbody.appendChild(tr);
+  });
+
+  document.getElementById('resultCard').classList.remove('hidden');
+  unlockCLI();
+}
+
+function resetCalc() {
+  subnetData = [];
+  document.getElementById('calcError').textContent = '';
+  document.getElementById('flsmNet').value  = '';
+  document.getElementById('flsmMask').value = '';
+  document.getElementById('flsmCount').value = '';
+  document.getElementById('vlsmNet').value  = '';
+  document.getElementById('vlsmList').innerHTML = '';
+  vlsmEntryCount = 0;
+  lockCLI();
+  loadDefaultData();
+}
+
+// ============================================================
+//  DEFAULT PRELOADED DATA
+// ============================================================
+function loadDefaultData() {
+  subnetData = [
+    { no:1, hosts:100, cidr:'/25', octet:'4th', increment:128, networkId:'192.168.10.0',   mask:'255.255.255.128', first:'192.168.10.1',   last:'192.168.10.126', broadcast:'192.168.10.127', networkInt:ipToInt('192.168.10.0'),   prefix:25, maskInt:prefixToMask(25) },
+    { no:2, hosts:50,  cidr:'/26', octet:'4th', increment:64,  networkId:'192.168.10.128', mask:'255.255.255.192', first:'192.168.10.129', last:'192.168.10.190', broadcast:'192.168.10.191', networkInt:ipToInt('192.168.10.128'), prefix:26, maskInt:prefixToMask(26) },
+    { no:3, hosts:10,  cidr:'/28', octet:'4th', increment:16,  networkId:'192.168.10.192', mask:'255.255.255.240', first:'192.168.10.193', last:'192.168.10.206', broadcast:'192.168.10.207', networkInt:ipToInt('192.168.10.192'), prefix:28, maskInt:prefixToMask(28) },
+    { no:4, hosts:2,   cidr:'/30', octet:'4th', increment:4,   networkId:'192.168.10.208', mask:'255.255.255.252', first:'192.168.10.209', last:'192.168.10.210', broadcast:'192.168.10.211', networkInt:ipToInt('192.168.10.208'), prefix:30, maskInt:prefixToMask(30) },
+    { no:5, hosts:2,   cidr:'/30', octet:'4th', increment:4,   networkId:'192.168.10.212', mask:'255.255.255.252', first:'192.168.10.213', last:'192.168.10.214', broadcast:'192.168.10.215', networkInt:ipToInt('192.168.10.212'), prefix:30, maskInt:prefixToMask(30) },
+    { no:6, hosts:2,   cidr:'/30', octet:'4th', increment:4,   networkId:'192.168.10.216', mask:'255.255.255.252', first:'192.168.10.217', last:'192.168.10.218', broadcast:'192.168.10.219', networkInt:ipToInt('192.168.10.216'), prefix:30, maskInt:prefixToMask(30) },
+  ];
+  document.getElementById('tableInfoRow').innerHTML =
+    `<span>192.168.10.0 /24 &mdash; VLSM (Demo)</span>
+     <span class="next-label">Next Available:</span>
+     <span class="next-addr">192.168.10.220</span>`;
+  const tbody = document.getElementById('subnetTbody');
+  tbody.innerHTML = '';
+  subnetData.forEach(s => {
+    const tr = document.createElement('tr');
+    tr.innerHTML = `
+      <td class="col-no">${s.no}</td>
+      <td>${s.hosts.toLocaleString()}</td>
+      <td class="col-cidr">${s.cidr}</td>
+      <td class="col-octet">${s.octet}</td>
+      <td class="col-inc">${s.increment}</td>
+      <td class="col-network">${s.networkId}</td>
+      <td>${s.mask}</td>
+      <td>${s.first}</td>
+      <td>${s.last}</td>
+      <td>${s.broadcast}</td>`;
+    tbody.appendChild(tr);
+  });
+  unlockCLI();
+}
+
+// ============================================================
+//  CHEAT SHEET
+// ============================================================
+const CHEAT_ROWS = [
+  { bin:'2^2',  hosts:4,          inc:4,   cidr:'/30', mask:'255.255.255.252' },
+  { bin:'2^3',  hosts:8,          inc:8,   cidr:'/29', mask:'255.255.255.248' },
+  { bin:'2^4',  hosts:16,         inc:16,  cidr:'/28', mask:'255.255.255.240' },
+  { bin:'2^5',  hosts:32,         inc:32,  cidr:'/27', mask:'255.255.255.224' },
+  { bin:'2^6',  hosts:64,         inc:64,  cidr:'/26', mask:'255.255.255.192' },
+  { bin:'2^7',  hosts:128,        inc:128, cidr:'/25', mask:'255.255.255.128' },
+  { bin:'2^8',  hosts:256,        inc:1,   cidr:'/24', mask:'255.255.255.0'   },
+  { bin:'2^9',  hosts:512,        inc:2,   cidr:'/23', mask:'255.255.254.0'   },
+  { bin:'2^10', hosts:1024,       inc:4,   cidr:'/22', mask:'255.255.252.0'   },
+  { bin:'2^11', hosts:2048,       inc:8,   cidr:'/21', mask:'255.255.248.0'   },
+  { bin:'2^12', hosts:4096,       inc:16,  cidr:'/20', mask:'255.255.240.0'   },
+  { bin:'2^13', hosts:8192,       inc:32,  cidr:'/19', mask:'255.255.224.0'   },
+  { bin:'2^14', hosts:16384,      inc:64,  cidr:'/18', mask:'255.255.192.0'   },
+  { bin:'2^15', hosts:32768,      inc:128, cidr:'/17', mask:'255.255.128.0'   },
+  { bin:'2^16', hosts:65536,      inc:1,   cidr:'/16', mask:'255.255.0.0'     },
 ];
 
-const CIDR_30 = { cidr: 30, block: 4, usable: 2, incr: 4, mask: '255.255.255.252', octet: '4th' };
-
-function findCidr(hosts) {
-  for (const e of CIDR_TABLE) if (e.usable >= hosts) return e;
-  return null;
-}
-
-/* ============================================================
-   3. HOST INPUT BOX MANAGEMENT
-   ============================================================ */
-
-let hostIdSeq = 0;
-
-function addHostBox(val = '') {
-  const wrap = document.getElementById('hostBoxes');
-  const id   = ++hostIdSeq;
-  const n    = wrap.querySelectorAll('.host-box').length + 1;
-  const div  = document.createElement('div');
-  div.className = 'host-box';
-  div.id        = `hb-${id}`;
-  div.setAttribute('role', 'listitem');
-  div.innerHTML = `
-    <span class="host-box-tag">R${n}</span>
-    <input type="number" min="1" placeholder="Hosts" value="${val}"
-           aria-label="Router ${n} hosts" oninput="updateWanPreview()">
-    <button class="host-box-rm" onclick="removeHostBox(${id})"
-            title="Remove" aria-label="Remove Router ${n}">✕</button>`;
-  wrap.insertBefore(div, wrap.querySelector('.btn-add'));
-  renumberHostBoxes();
-  updateWanPreview();
-}
-
-function removeHostBox(id) {
-  document.getElementById(`hb-${id}`)?.remove();
-  renumberHostBoxes();
-  updateWanPreview();
-}
-
-function renumberHostBoxes() {
-  document.querySelectorAll('#hostBoxes .host-box').forEach((b, i) => {
-    b.querySelector('.host-box-tag').textContent = `R${i + 1}`;
-  });
-}
-
-function getRouterCount() {
-  return document.querySelectorAll('#hostBoxes .host-box').length;
-}
-
-function getHostInputs() {
-  return Array.from(document.querySelectorAll('#hostBoxes .host-box'))
-    .map((box, i) => ({
-      h:    parseInt(box.querySelector('input').value, 10),
-      rIdx: i,
-    }))
-    .filter(({ h }) => !isNaN(h) && h > 0);
-}
-
-/* ============================================================
-   4. TOPOLOGY SELECTION & WAN LINK GENERATION
-   ============================================================ */
-
-let selectedTopo = 'bus';
-
-function selectTopo(topo) {
-  selectedTopo = topo;
-  ['bus', 'ring'].forEach(t => {
-    const c = document.getElementById(`topo-${t}`);
-    c.classList.toggle('active', t === topo);
-    c.setAttribute('aria-checked', t === topo ? 'true' : 'false');
-  });
-  updateWanPreview();
-}
-
-/**
- * Generates ordered WAN link definitions based on topology.
- *
- * Bus:  R1→R2, R2→R3, ..., R(N-1)→RN        (N-1 links)
- * Ring: R1→R2, R2→R3, ..., R(N-1)→RN, RN→R1 (N   links)
- *
- * DIRECTION RULE:
- *   r0 = OUT side (Serial0/x/0, firstIP)
- *   r1 = IN  side (Serial0/x/1, lastIP)
- */
-function generateWANLinks(n, topo) {
-  const links = [];
-  for (let i = 0; i < n - 1; i++) {
-    links.push({ label: `R${i + 1}-R${i + 2}`, r0: i, r1: i + 1 });
-  }
-  if (topo === 'ring' && n > 2) {
-    links.push({ label: `R${n}-R1`, r0: n - 1, r1: 0 });
-  }
-  return links;
-}
-
-function updateWanPreview() {
-  const n       = getRouterCount();
-  const preview = document.getElementById('wanPreview');
-  const info    = document.getElementById('topoInfo');
-
-  if (n < 2) {
-    preview.classList.add('hidden');
-    info.classList.add('hidden');
-    return;
-  }
-
-  const links     = generateWANLinks(n, selectedTopo);
-  const topoLabel = selectedTopo === 'ring' ? 'Ring' : 'Bus/Linear';
-
-  preview.classList.remove('hidden');
-  preview.style.display = 'block';
-  document.getElementById('wanTags').innerHTML =
-    links.map(l => `<span class="wan-tag">🔗 ${l.label} Link</span>`).join('');
-
-  info.classList.remove('hidden');
-  info.innerHTML = `Topology: <b>${topoLabel}</b> · ${n} routers → <b>${links.length} /30 WAN links</b> auto-generated`;
-}
-
-/* ============================================================
-   5a. WAN START ADDRESS HELPER
-   ============================================================
-   Computes a safe start address for all WAN /30 blocks so they
-   stay INSIDE the same major classful network as the base IP.
-
-   Strategy:
-     1. Find the LAST address of the major network (class boundary)
-     2. Step back enough /30 blocks for all WAN links
-     3. Align to a /30 boundary (multiple of 4)
-
-   Example — base 172.168.0.0 (Class B → major = 172.168.0.0/16):
-     Last address of class: 172.168.255.255
-     For 4 WAN links (16 addresses): start at 172.168.255.240
-     Aligned /30 blocks: .240, .244, .248, .252
-
-   This guarantees:
-     ✔ ALL WAN /30s are in the same major network as LAN subnets
-     ✔ RIP only needs ONE network statement
-     ✔ No discontiguous network issues
-   ============================================================ */
-
-/**
- * Returns the integer start address for WAN /30 allocation.
- * Placed near the END of the major network so it never overlaps
- * with LAN subnets growing from the start.
- *
- * @param {string} baseIp    - user-entered base network IP
- * @param {number} wanCount  - number of /30 WAN links needed
- * @returns {number} - integer IP of first WAN /30 network address
- */
-function getWanStartAddress(baseIp, wanCount) {
-  const baseInt  = ipToInt(baseIp);
-  const firstOct = (baseInt >>> 24) & 255;
-  const secOct   = (baseInt >>> 16) & 255;
-  const thirdOct = (baseInt >>>  8) & 255;
-
-  // Determine last address of the major classful network
-  let majorLastInt;
-  if (firstOct >= 1 && firstOct <= 126) {
-    // Class A — x.0.0.0/8 — last address x.255.255.255
-    majorLastInt = ((firstOct << 24) | 0x00FFFFFF) >>> 0;
-  } else if (firstOct >= 128 && firstOct <= 191) {
-    // Class B — x.y.0.0/16 — last address x.y.255.255
-    majorLastInt = ((firstOct << 24) | (secOct << 16) | 0x0000FFFF) >>> 0;
-  } else {
-    // Class C — x.y.z.0/24 — last address x.y.z.255
-    majorLastInt = ((firstOct << 24) | (secOct << 16) | (thirdOct << 8) | 0xFF) >>> 0;
-  }
-
-  // Each /30 block = 4 addresses. Total space needed:
-  const totalNeeded = wanCount * 4;
-
-  // Start address = last address of major network minus total needed,
-  // then aligned DOWN to nearest /30 boundary (multiple of 4)
-  let wanStart = (majorLastInt - totalNeeded + 1) >>> 0;
-  wanStart     = (wanStart & ~3) >>> 0;  // align to /30 boundary
-
-  return wanStart;
-}
-
-/* ============================================================
-   5. CORE VLSM CALCULATION
-   ============================================================ */
-
-let vlsmData      = [];
-let lanSubnets    = [];
-let serialSubnets = [];
-let topoUsed      = '';
-let currentProto  = '';
-
-function calculate() {
-  document.getElementById('error').textContent = '';
-
-  const baseStr = document.getElementById('base').value.trim();
-  if (!/^\d+\.\d+\.\d+\.\d+$/.test(baseStr)) {
-    showError('Invalid base IP address. Use format: x.x.x.x');
-    return;
-  }
-
-  const inputs = getHostInputs();
-  if (!inputs.length) {
-    showError('Add at least one router with a host count.');
-    return;
-  }
-
-  vlsmData = []; lanSubnets = []; serialSubnets = [];
-  topoUsed = selectedTopo;
-
-  const n        = inputs.length;
-  const wanLinks = generateWANLinks(n, selectedTopo);
-
-  // VLSM rule: allocate largest subnet first
-  const sorted = [...inputs].sort((a, b) => b.h - a.h);
-  let cursor   = ipToInt(baseStr);
-
-  // ── LAN subnet allocation ──────────────────────────────
-  for (const { h, rIdx } of sorted) {
-    const e = findCidr(h);
-    if (!e) { showError(`No CIDR block found for ${h} hosts.`); return; }
-
-    const netInt   = cursor >>> 0;
-    const bcastInt = (netInt + e.block - 1) >>> 0;
-
-    const sub = {
-      type:      'lan',
-      routerIdx: rIdx,
-      label:     `R${rIdx + 1} LAN`,
-      hostsReq:  h,
-      cidr:      e.cidr,
-      usable:    e.usable,
-      octet:     e.octet,
-      incr:      e.incr,
-      netAddr:   intToIp(netInt),
-      netInt,
-      mask:      e.mask,
-      firstIP:   intToIp((netInt + 1) >>> 0),
-      lastIP:    intToIp((bcastInt - 1) >>> 0),
-      broadcast: intToIp(bcastInt),
-      bcastInt,
-      block:     e.block,
-    };
-    vlsmData.push(sub);
-    lanSubnets.push(sub);
-    cursor = (bcastInt + 1) >>> 0;
-  }
-
-  // Sort LAN list by original router order
-  lanSubnets.sort((a, b) => a.routerIdx - b.routerIdx);
-
-  // ── WAN /30 allocation ─────────────────────────────────
-  // CRITICAL RIP FIX: All WAN /30 subnets MUST stay inside the
-  // SAME major classful network as the base IP.
-  //
-  // Problem: if LAN subnets grow past e.g. 172.168.255.x, the next
-  // sequential cursor becomes 172.169.0.0 — a DIFFERENT Class B.
-  // RIP would then see two major networks → discontiguous → broken.
-  //
-  // Solution: place WAN /30 blocks at a known safe address near the
-  // END of the major network, working backwards from the last /30-
-  // aligned address inside the same class boundary.
-  const wanStart = getWanStartAddress(baseStr, wanLinks.length);
-  let wanCursor  = wanStart;
-
-  for (let i = 0; i < wanLinks.length; i++) {
-    const wl       = wanLinks[i];
-    const netInt   = wanCursor >>> 0;
-    const bcastInt = (netInt + 4 - 1) >>> 0;
-    const firstInt = (netInt + 1) >>> 0;
-    const lastInt  = (bcastInt - 1) >>> 0;
-
-    const sub = {
-      type:      'wan',
-      label:     `${wl.label} Link`,
-      r0idx:     wl.r0,
-      r1idx:     wl.r1,
-      hostsReq:  2,
-      cidr:      30,
-      usable:    2,
-      octet:     '4th',
-      incr:      4,
-      netAddr:   intToIp(netInt),
-      netInt,
-      mask:      CIDR_30.mask,
-      firstIP:   intToIp(firstInt),
-      firstInt,
-      lastIP:    intToIp(lastInt),
-      lastInt,
-      broadcast: intToIp(bcastInt),
-      bcastInt,
-      block:     4,
-    };
-    vlsmData.push(sub);
-    serialSubnets.push(sub);
-    wanCursor = (bcastInt + 1) >>> 0;
-  }
-
-  renderTable(cursor, wanCursor);
-
-  document.getElementById('tableCard').classList.remove('hidden');
-  document.getElementById('routingCard').classList.remove('hidden');
-  document.getElementById('cliPanel').classList.add('hidden');
-  ['static', 'rip', 'ospf', 'eigrp'].forEach(p =>
-    document.getElementById(`pb-${p}`).classList.remove('active')
-  );
-
-  setTimeout(() =>
-    document.getElementById('tableCard').scrollIntoView({ behavior: 'smooth', block: 'start' }),
-    60
-  );
-}
-
-function clearAll() {
-  vlsmData = []; lanSubnets = []; serialSubnets = [];
-  ['vlsmBody', 'cliBlocks', 'summaryRow'].forEach(id =>
-    document.getElementById(id).innerHTML = ''
-  );
-  document.getElementById('error').textContent = '';
-  ['tableCard', 'routingCard', 'cliPanel'].forEach(id =>
-    document.getElementById(id).classList.add('hidden')
-  );
-  ['static', 'rip', 'ospf', 'eigrp'].forEach(p =>
-    document.getElementById(`pb-${p}`).classList.remove('active')
-  );
-}
-
-function showError(msg) {
-  document.getElementById('error').innerHTML = `<span>⚠</span><span>${msg}</span>`;
-}
-
-/* ============================================================
-   6. TABLE RENDERER
-   ============================================================ */
-
-function renderTable(nextFreeInt, wanNextInt) {
-  const body = document.getElementById('vlsmBody');
-  body.innerHTML = '';
-  let rowNum = 0;
-
-  // LAN rows — sorted largest-first
-  [...lanSubnets].sort((a, b) => b.hostsReq - a.hostsReq).forEach(s => {
-    rowNum++;
+function buildCheatSheet() {
+  const tbody = document.getElementById('cheatTbody');
+  if (!tbody) return;
+  CHEAT_ROWS.forEach(r => {
     const tr = document.createElement('tr');
-    tr.className = 'row-lan';
     tr.innerHTML = `
-      <td>${rowNum}</td>
-      <td><span class="td-badge badge-lan">LAN</span></td>
-      <td class="td-mono">${s.label}</td>
-      <td>${s.hostsReq.toLocaleString()}</td>
-      <td>${s.usable.toLocaleString()}</td>
-      <td class="td-cidr">/${s.cidr}</td>
-      <td>${s.octet}</td>
-      <td>${s.incr}</td>
-      <td class="td-net">${s.netAddr}</td>
-      <td class="td-mask">${s.mask}</td>
-      <td class="td-mono">${s.firstIP}</td>
-      <td class="td-mono">${s.lastIP}</td>
-      <td class="td-mono">${s.broadcast}</td>`;
-    body.appendChild(tr);
+      <td class="mono muted">${r.bin}</td>
+      <td class="mono">${r.hosts.toLocaleString()}</td>
+      <td class="mono green bold">${r.inc}</td>
+      <td class="mono blue bold">${r.cidr}</td>
+      <td class="mono">${r.mask}</td>`;
+    tbody.appendChild(tr);
   });
-
-  // WAN /30 rows — annotated with OUT/IN
-  serialSubnets.forEach(s => {
-    rowNum++;
-    const tr = document.createElement('tr');
-    tr.className = 'row-wan';
-    const r0name = `R${s.r0idx + 1}`;
-    const r1name = `R${s.r1idx + 1}`;
-    tr.innerHTML = `
-      <td>${rowNum}</td>
-      <td><span class="td-badge badge-wan">WAN</span></td>
-      <td class="td-mono">${s.label}</td>
-      <td>2</td><td>2</td>
-      <td class="td-cidr">/30</td>
-      <td>4th</td><td>4</td>
-      <td class="td-wan-net">${s.netAddr}</td>
-      <td class="td-mask">${s.mask}</td>
-      <td class="td-mono">${s.firstIP} <span style="color:#6e7681;font-size:10px;">(OUT · ${r0name} S0/1/0)</span></td>
-      <td class="td-mono">${s.lastIP}  <span style="color:#6e7681;font-size:10px;">(IN  · ${r1name} S0/1/1)</span></td>
-      <td class="td-mono">${s.broadcast}</td>`;
-    body.appendChild(tr);
-  });
-
-  const totalHosts = lanSubnets.reduce((s, r) => s + r.hostsReq, 0);
-  const topoLabel  = topoUsed === 'ring' ? 'Ring' : 'Bus/Linear';
-
-  document.getElementById('tableSubtitle').textContent =
-    `${lanSubnets.length} LAN · ${serialSubnets.length} WAN /30 · ${topoLabel} Topology`;
-
-  document.getElementById('summaryRow').innerHTML = `
-    <div class="s-chip"><span class="s-chip-label">Routers</span>       <span class="s-chip-val">${lanSubnets.length}</span></div>
-    <div class="s-chip"><span class="s-chip-label">LAN Subnets</span>   <span class="s-chip-val">${lanSubnets.length}</span></div>
-    <div class="s-chip"><span class="s-chip-label">WAN /30 Links</span> <span class="s-chip-val">${serialSubnets.length}</span></div>
-    <div class="s-chip"><span class="s-chip-label">Topology</span>      <span class="s-chip-val">${topoLabel}</span></div>
-    <div class="s-chip"><span class="s-chip-label">Total Hosts</span>   <span class="s-chip-val">${totalHosts.toLocaleString()}</span></div>
-    <div class="s-chip"><span class="s-chip-label">Next Free (LAN)</span>  <span class="s-chip-val">${intToIp(nextFreeInt)}</span></div>
-    <div class="s-chip"><span class="s-chip-label">Same Major Network</span>  <span class="s-chip-val">${getMajorNetwork(intToIp(nextFreeInt))}</span></div>
-  `;
 }
 
-/* ============================================================
-   7. ROUTER OBJECT BUILDER — STRICT DIRECTION-AWARE PORT ASSIGNMENT
-   ============================================================
-   RULES:
-     OUT links → Serial0/1/0, Serial0/2/0, Serial0/3/0  (slot = outIdx+1, pin = 0)
-     IN  links → Serial0/1/1, Serial0/2/1, Serial0/3/1  (slot = inIdx+1,  pin = 1)
-
-   firstIP of /30 → OUT router's interface
-   lastIP  of /30 → IN  router's interface
-
-   This is consistent with Cisco point-to-point serial convention:
-     /0 = DCE/DTE OUT side
-     /1 = DCE/DTE IN  side
-   ============================================================ */
-
-function buildRouters() {
-  const routers = lanSubnets.map(lan => ({
-    idx:      lan.routerIdx + 1,
-    hosts:    lan.hostsReq,
-    lan,
-    outLinks: [],  // links where this router is the OUT side
-    inLinks:  [],  // links where this router is the IN  side
-  }));
-
-  serialSubnets.forEach(ser => {
-    const rOut = routers.find(r => r.idx === ser.r0idx + 1);
-    const rIn  = routers.find(r => r.idx === ser.r1idx + 1);
-
-    if (rOut) {
-      rOut.outLinks.push({
-        sub:     ser,
-        dir:     'OUT',
-        ip:      ser.firstIP,       // OUT gets firstIP
-        mask:    ser.mask,
-        peer:    ser.lastIP,        // peer IP (IN side)
-        peerIdx: ser.r1idx + 1,
-        label:   ser.label,
-      });
-    }
-
-    if (rIn) {
-      rIn.inLinks.push({
-        sub:     ser,
-        dir:     'IN',
-        ip:      ser.lastIP,        // IN gets lastIP
-        mask:    ser.mask,
-        peer:    ser.firstIP,       // peer IP (OUT side)
-        peerIdx: ser.r0idx + 1,
-        label:   ser.label,
-      });
-    }
-  });
-
-  // Assign interface names based on direction
-  routers.forEach(router => {
-    // OUT interfaces: Serial0/1/0, Serial0/2/0, ...
-    router.outLinks.forEach((link, i) => {
-      link.iface = `Serial0/${i + 1}/0`;
-    });
-    // IN interfaces: Serial0/1/1, Serial0/2/1, ...
-    router.inLinks.forEach((link, i) => {
-      link.iface = `Serial0/${i + 1}/1`;
-    });
-
-    // Combined list for iteration convenience
-    router.serials = [...router.outLinks, ...router.inLinks];
-  });
-
-  return routers;
+// ============================================================
+//  EXPORT XLSX
+// ============================================================
+function exportXLSX() {
+  const headers = ['#','Hosts','CIDR','Octet','Increment','Network Address','Subnet Mask','1st Usable','Last Usable','Broadcast'];
+  const rows = subnetData.map(s => [s.no, s.hosts, s.cidr, s.octet, s.increment, s.networkId, s.mask, s.first, s.last, s.broadcast]);
+  const ws = buildWorksheet([headers, ...rows]);
+  const wb = buildWorkbook(ws, 'Subnets');
+  downloadXLSX(wb, 'vlsm_table.xlsx');
 }
 
-/* ============================================================
-   8. VISUAL CONNECTION MAP
-   ============================================================
-   Output format per link:
-
-   R1 (Serial0/1/0) OUT ─────────── IN (Serial0/1/1) R2
-     /30 Network : 172.168.x.x
-     OUT IP      : 172.168.x.x  → R1 Serial0/1/0
-     IN  IP      : 172.168.x.x  → R2 Serial0/1/1
-   ============================================================ */
-
-function buildConnectionMap(routers, topo) {
-  const N   = '\n';
-  const SEP = '─'.repeat(52);
-  let   out = '';
-
-  out += 'CONNECTION MAP — ' + (topo === 'ring' ? 'Ring' : 'Bus/Linear') + ' Topology' + N;
-  out += SEP + N;
-  out += 'RULE: OUT side → Serial0/x/0  uses firstIP of /30' + N;
-  out += '      IN  side → Serial0/x/1  uses lastIP  of /30' + N;
-  out += SEP + N + N;
-
-  serialSubnets.forEach((ser, i) => {
-    const rOut   = routers.find(r => r.idx === ser.r0idx + 1);
-    const rIn    = routers.find(r => r.idx === ser.r1idx + 1);
-    if (!rOut || !rIn) return;
-
-    const outLink  = rOut.outLinks.find(l => l.sub.netAddr === ser.netAddr);
-    const inLink   = rIn.inLinks.find(l  => l.sub.netAddr === ser.netAddr);
-    const outIface = outLink ? outLink.iface : 'Serial0/1/0';
-    const inIface  = inLink  ? inLink.iface  : 'Serial0/1/1';
-
-    out += `Link ${i + 1}: ${ser.label}` + N;
-    out += `  R${rOut.idx} (${outIface}) OUT ─────────── IN (${inIface}) R${rIn.idx}` + N;
-    out += `  /30 Network : ${ser.netAddr}/30  (${ser.mask})` + N;
-    out += `  OUT IP      : ${ser.firstIP}  → R${rOut.idx} ${outIface}` + N;
-    out += `  IN  IP      : ${ser.lastIP}  → R${rIn.idx} ${inIface}` + N;
-    out += N;
-  });
-
-  out += SEP + N;
-  out += 'FULL CHAIN:  ';
-  // Print chain string  R1 → R2 → R3 → ... (→ R1 if ring)
-  for (let i = 0; i < lanSubnets.length; i++) {
-    out += `R${i + 1}`;
-    if (i < lanSubnets.length - 1) out += ' → ';
-  }
-  if (topo === 'ring' && lanSubnets.length > 2) out += ' → R1';
-  out += N;
-
-  return out;
-}
-
-/* ============================================================
-   9. NEXT-HOP RESOLVER — BFS
-   ============================================================ */
-
-function resolveNextHop(router, targetSub, routers) {
-  const allLinks = [...router.outLinks, ...router.inLinks];
-
-  // Direct adjacency check
-  for (const link of allLinks) {
-    const peer     = routers.find(r => r.idx === link.peerIdx);
-    if (!peer) continue;
-    if (peer.lan.netAddr === targetSub.netAddr) return link.peer;
-    const peerAll  = [...peer.outLinks, ...peer.inLinks];
-    if (peerAll.some(pl => pl.sub.netAddr === targetSub.netAddr)) return link.peer;
-  }
-
-  // Multi-hop BFS (handles ring topology)
-  const visited = new Set([router.idx]);
-  const queue   = allLinks.map(s => ({ peerIdx: s.peerIdx, nextHop: s.peer }));
-
-  while (queue.length) {
-    const { peerIdx, nextHop } = queue.shift();
-    if (visited.has(peerIdx)) continue;
-    visited.add(peerIdx);
-
-    const pr = routers.find(r => r.idx === peerIdx);
-    if (!pr) continue;
-
-    if (pr.lan.netAddr === targetSub.netAddr) return nextHop;
-    const prAll = [...pr.outLinks, ...pr.inLinks];
-    if (prAll.some(pl => pl.sub.netAddr === targetSub.netAddr)) return nextHop;
-    prAll.forEach(s => {
-      if (!visited.has(s.peerIdx)) queue.push({ peerIdx: s.peerIdx, nextHop });
-    });
-  }
-
-  return allLinks.length > 0 ? allLinks[0].peer : null;
-}
-
-/* ============================================================
-   10. CISCO IOS CLI BUILDERS
-   ============================================================ */
-
-const NL = '\n';
-
-/**
- * Stage 1 — Interface Configuration
- *
- * Pure Cisco IOS syntax:
- *   • No leading spaces before commands
- *   • ! comments are valid IOS syntax (ignored by parser)
- *   • enable + configure terminal at start
- *   • exit after each interface block
- *   • end at bottom
- *
- * Interface order:
- *   1. FastEthernet0/0 (LAN)
- *   2. OUT serial links (Serial0/1/0, Serial0/2/0, ...)
- *   3. IN  serial links (Serial0/1/1, Serial0/2/1, ...)
- */
-function generateInterfaces(router) {
-  let c = '';
-  c += 'enable'             + NL;
-  c += 'configure terminal' + NL;
-  c += NL;
-
-  // LAN interface
-  c += '!' + NL;
-  c += '! LAN Interface' + NL;
-  c += '!' + NL;
-  c += 'interface FastEthernet0/0'                                    + NL;
-  c += 'ip address ' + router.lan.firstIP + ' ' + router.lan.mask    + NL;
-  c += 'no shutdown'                                                  + NL;
-  c += 'exit'                                                         + NL;
-
-  // OUT serial interfaces
-  router.outLinks.forEach(link => {
-    c += NL;
-    c += '!' + NL;
-    c += '! OUT to R' + link.peerIdx + ' — ' + link.iface            + NL;
-    c += '!' + NL;
-    c += 'interface ' + link.iface                                    + NL;
-    c += 'ip address ' + link.ip + ' ' + link.mask                   + NL;
-    c += 'no shutdown'                                                + NL;
-    c += 'exit'                                                       + NL;
-  });
-
-  // IN serial interfaces
-  router.inLinks.forEach(link => {
-    c += NL;
-    c += '!' + NL;
-    c += '! IN from R' + link.peerIdx + ' — ' + link.iface           + NL;
-    c += '!' + NL;
-    c += 'interface ' + link.iface                                    + NL;
-    c += 'ip address ' + link.ip + ' ' + link.mask                   + NL;
-    c += 'no shutdown'                                                + NL;
-    c += 'exit'                                                       + NL;
-  });
-
-  c += NL;
-  c += 'end' + NL;
-  return c;
-}
-
-/* ─────────────────────────────────────────────────────────────
-   HELPER: getMajorNetwork
-   Returns the classful major network for any IP address.
-   This is what Cisco RIP uses — NOT the subnet, NOT the /30.
-
-   Class A  (1–126)   → a.0.0.0
-   Class B  (128–191) → a.b.0.0
-   Class C  (192–223) → a.b.c.0
-───────────────────────────────────────────────────────────── */
-function getMajorNetwork(ip) {
-  const parts = ip.trim().split('.').map(Number);
-  const a = parts[0], b = parts[1], c = parts[2];
-  if (a >= 1   && a <= 126) return a + '.0.0.0';
-  if (a >= 128 && a <= 191) return a + '.' + b + '.0.0';
-  if (a >= 192 && a <= 223) return a + '.' + b + '.' + c + '.0';
-  return null;
-}
-
-/* ─────────────────────────────────────────────────────────────
-   HELPER: bfsHopCount
-   Returns the number of hops from a router to the router that
-   owns a given target subnet.  Used to sort static routes
-   farthest → nearest (best practice output order).
-───────────────────────────────────────────────────────────── */
-function bfsHopCount(router, targetSub, routers) {
-  const visited = new Set([router.idx]);
-  const queue   = [...router.outLinks, ...router.inLinks]
-                    .map(l => ({ peerIdx: l.peerIdx, hops: 1 }));
-
-  while (queue.length) {
-    const { peerIdx, hops } = queue.shift();
-    if (visited.has(peerIdx)) continue;
-    visited.add(peerIdx);
-
-    const pr = routers.find(r => r.idx === peerIdx);
-    if (!pr) continue;
-
-    if (pr.lan.netAddr === targetSub.netAddr) return hops;
-    const prAll = [...pr.outLinks, ...pr.inLinks];
-    if (prAll.some(pl => pl.sub.netAddr === targetSub.netAddr)) return hops;
-
-    prAll.forEach(l => {
-      if (!visited.has(l.peerIdx)) queue.push({ peerIdx: l.peerIdx, hops: hops + 1 });
-    });
-  }
-  return 999;
-}
-
-/* ─────────────────────────────────────────────────────────────
-   HELPER: findAlternatePath
-   For ring topology, finds the SECONDARY next-hop to a target
-   (the path going the other way around the ring).
-   Returns null if no alternate path exists (bus topology).
-───────────────────────────────────────────────────────────── */
-function findAlternatePath(router, targetSub, primaryNextHop, routers) {
-  const allLinks = [...router.outLinks, ...router.inLinks];
-
-  // Collect all neighbor IPs except the one used by primary path
-  const alternateLinks = allLinks.filter(l => l.peer !== primaryNextHop);
-
-  for (const link of alternateLinks) {
-    // BFS from this alternate neighbor toward target
-    const visited = new Set([router.idx]);
-    const queue   = [{ peerIdx: link.peerIdx, nextHop: link.peer }];
-
-    while (queue.length) {
-      const { peerIdx, nextHop } = queue.shift();
-      if (visited.has(peerIdx)) continue;
-      visited.add(peerIdx);
-
-      const pr = routers.find(r => r.idx === peerIdx);
-      if (!pr) continue;
-
-      if (pr.lan.netAddr === targetSub.netAddr) return nextHop;
-      const prAll = [...pr.outLinks, ...pr.inLinks];
-      if (prAll.some(pl => pl.sub.netAddr === targetSub.netAddr)) return nextHop;
-
-      prAll.forEach(s => {
-        if (!visited.has(s.peerIdx)) queue.push({ peerIdx: s.peerIdx, nextHop });
-      });
-    }
-  }
-  return null;
-}
-
-/**
- * Stage 2 — Static Routing
- *
- * Rules enforced:
- *  ✔ Routes only to REMOTE networks (never directly connected)
- *  ✔ Next-hop = closest neighbor toward destination (BFS)
- *  ✔ Routes ordered farthest → nearest
- *  ✔ Ring topology: primary route + floating backup (AD 5)
- *  ✔ No route to self, no destination as next-hop
- */
-function generateStatic(router, routers) {
-  // Directly connected networks — never generate routes for these
-  const myNets = new Set([
-    router.lan.netAddr,
-    ...router.outLinks.map(l => l.sub.netAddr),
-    ...router.inLinks.map(l  => l.sub.netAddr),
-  ]);
-
-  // Collect all remote LAN subnets only (WAN /30 routes are optional,
-  // but we include them for full reachability in Packet Tracer)
-  const remoteSubs = [...lanSubnets, ...serialSubnets]
-    .filter(sub => !myNets.has(sub.netAddr));
-
-  // Sort farthest first (highest hop count first)
-  remoteSubs.sort((a, b) => {
-    const hA = bfsHopCount(router, a, routers);
-    const hB = bfsHopCount(router, b, routers);
-    return hB - hA;
-  });
-
-  let c = '';
-  c += 'enable'              + NL;
-  c += 'configure terminal'  + NL;
-  c += NL;
-  c += '! Static Routing'    + NL;
-  c += NL;
-
-  remoteSubs.forEach(sub => {
-    const primaryNH = resolveNextHop(router, sub, routers);
-    if (!primaryNH) return;
-
-    // Primary route
-    c += 'ip route ' + sub.netAddr + ' ' + sub.mask + ' ' + primaryNH + NL;
-
-    // Floating backup route for ring topology only
-    if (topoUsed === 'ring') {
-      const backupNH = findAlternatePath(router, sub, primaryNH, routers);
-      if (backupNH && backupNH !== primaryNH) {
-        c += 'ip route ' + sub.netAddr + ' ' + sub.mask + ' ' + backupNH + ' 5' + NL;
+function buildWorksheet(data) {
+  let xml = '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>';
+  xml += '<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><sheetData>';
+  data.forEach((row, ri) => {
+    const sIdx = ri === 0 ? 1 : 2;
+    xml += `<row r="${ri + 1}">`;
+    row.forEach((cell, ci) => {
+      const ref = colName(ci) + (ri + 1);
+      if (typeof cell === 'number') {
+        xml += `<c r="${ref}" s="${sIdx}"><v>${cell}</v></c>`;
+      } else {
+        const esc = String(cell).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+        xml += `<c r="${ref}" t="inlineStr" s="${sIdx}"><is><t>${esc}</t></is></c>`;
       }
-    }
-  });
-
-  c += NL;
-  c += 'end' + NL;
-  return c;
-}
-
-/**
- * Stage 2 — RIP v2
- *
- * Rules enforced (real Cisco IOS behavior):
- *  ✔ Uses getMajorNetwork() — classful boundaries only
- *  ✔ NEVER lists /30 subnets individually
- *  ✔ NEVER lists specific subnets of same major class
- *  ✔ Deduplicates automatically — one entry per major network
- *  ✔ Works for ANY IP range (not hardcoded to 173.168.x.x)
- *  ✔ passive-interface on LAN (stops unnecessary RIP hellos to hosts)
- *
- * Example: if all IPs are 172.168.x.x:
- *   → ONLY outputs: network 172.168.0.0
- *   NOT: network 172.168.0.0 + network 172.168.194.128 (WRONG)
- */
-function generateRIP(router) {
-  const allLinks = [...router.outLinks, ...router.inLinks];
-
-  // Collect every IP this router has configured
-  const allIPs = [
-    router.lan.firstIP,
-    ...allLinks.map(l => l.ip),
-  ];
-
-  // Convert each IP to its classful major network and deduplicate
-  const majorNets = new Set();
-  allIPs.forEach(ip => {
-    const major = getMajorNetwork(ip);
-    if (major) majorNets.add(major);
-  });
-
-  let c = '';
-  c += 'enable'              + NL;
-  c += 'configure terminal'  + NL;
-  c += NL;
-  c += 'router rip'          + NL;
-  c += 'version 2'           + NL;
-  c += 'no auto-summary'     + NL;
-
-  // One network statement per unique major network
-  majorNets.forEach(net => {
-    c += 'network ' + net    + NL;
-  });
-
-  // passive-interface on LAN — prevents RIP updates to end hosts
-  c += 'passive-interface FastEthernet0/0' + NL;
-
-  c += 'exit'                + NL;
-  c += NL;
-  c += 'end'                 + NL;
-  return c;
-}
-
-/** Stage 2 — OSPF */
-function generateOSPF(router) {
-  const allLinks = [...router.outLinks, ...router.inLinks];
-
-  let c = '';
-  c += 'enable'             + NL;
-  c += 'configure terminal' + NL;
-  c += NL;
-  c += 'router ospf 1'      + NL;
-  c += 'network ' + router.lan.netAddr + ' ' + wildcardOf(router.lan.mask) + ' area 0' + NL;
-  allLinks.forEach(link => {
-    c += 'network ' + link.sub.netAddr + ' ' + wildcardOf(link.mask) + ' area 0' + NL;
-  });
-  c += 'exit' + NL;
-  c += NL;
-  c += 'end' + NL;
-  return c;
-}
-
-/** Stage 2 — EIGRP */
-function generateEIGRP(router) {
-  const allLinks = [...router.outLinks, ...router.inLinks];
-
-  let c = '';
-  c += 'enable'             + NL;
-  c += 'configure terminal' + NL;
-  c += NL;
-  c += 'router eigrp 100'   + NL;
-  c += 'no auto-summary'    + NL;
-  c += 'network ' + router.lan.netAddr + ' ' + wildcardOf(router.lan.mask) + NL;
-  allLinks.forEach(link => {
-    c += 'network ' + link.sub.netAddr + ' ' + wildcardOf(link.mask) + NL;
-  });
-  c += 'exit' + NL;
-  c += NL;
-  c += 'end' + NL;
-  return c;
-}
-
-/* ============================================================
-   11. CLI RENDERER
-   ============================================================ */
-
-const PROTO_NAMES = {
-  static: 'Static Routing',
-  rip:    'RIP v2',
-  ospf:   'OSPF',
-  eigrp:  'EIGRP',
-};
-
-const PROTO_BADGE_CLASS = {
-  static: 'cpb-static',
-  rip:    'cpb-rip',
-  ospf:   'cpb-ospf',
-  eigrp:  'cpb-eigrp',
-};
-
-function generateCLI(proto) {
-  if (!vlsmData.length) { alert('Please calculate VLSM first.'); return; }
-
-  currentProto = proto;
-  ['static', 'rip', 'ospf', 'eigrp'].forEach(p =>
-    document.getElementById(`pb-${p}`).classList.toggle('active', p === proto)
-  );
-
-  const routers  = buildRouters();
-  const blocksEl = document.getElementById('cliBlocks');
-  blocksEl.innerHTML = '';
-
-  document.getElementById('cliTitleText').textContent =
-    `cisco-ios — ${PROTO_NAMES[proto]} — ${topoUsed} topology`;
-  document.getElementById('cliProtoBadge').innerHTML =
-    `<span class="cli-proto-badge ${PROTO_BADGE_CLASS[proto]}">${PROTO_NAMES[proto]}</span>`;
-
-  // ── Connection Map block ──────────────────────────────
-  const mapText  = buildConnectionMap(routers, topoUsed);
-  const mapBlock = document.createElement('div');
-  mapBlock.className = 'router-block';
-  mapBlock._fullCli  = mapText;
-  mapBlock._stage1   = mapText;
-  mapBlock._stage2   = '';
-  mapBlock._label    = 'Connection Map';
-
-  const mapHdr     = document.createElement('div');
-  mapHdr.className = 'router-block-header';
-  mapHdr.innerHTML = `
-    <span class="router-block-title">🔗 Connection Map — Port & IP Assignment</span>
-    <div class="router-block-btns">
-      <button class="cli-btn cli-btn-copy" onclick="copyBlock(this)">⎘ Copy Map</button>
-    </div>`;
-  mapBlock.appendChild(mapHdr);
-
-  const mapCode     = document.createElement('div');
-  mapCode.className = 'cli-code';
-  mapCode.style.color = '#60a5fa';
-  mapCode.textContent = mapText;
-  mapBlock.appendChild(mapCode);
-  blocksEl.appendChild(mapBlock);
-
-  // ── Per-router CLI blocks ─────────────────────────────
-  routers.forEach(router => {
-    const stage1 = generateInterfaces(router);
-    let   stage2 = '';
-
-    switch (proto) {
-      case 'static': stage2 = generateStatic(router, routers); break;
-      case 'rip':    stage2 = generateRIP(router);             break;
-      case 'ospf':   stage2 = generateOSPF(router);            break;
-      case 'eigrp':  stage2 = generateEIGRP(router);           break;
-    }
-
-    const fullCli  = stage1 + NL + stage2;
-    const outPorts = router.outLinks.map(l => `${l.iface} → R${l.peerIdx} (${l.ip})`).join(', ') || '—';
-    const inPorts  = router.inLinks.map(l  => `${l.iface} ← R${l.peerIdx} (${l.ip})`).join(', ') || '—';
-    const title    = `Router ${router.idx} — ${router.hosts.toLocaleString()} Hosts — LAN: ${router.lan.netAddr}/${router.lan.cidr}`;
-    const portInfo = `OUT: ${outPorts}  |  IN: ${inPorts}`;
-
-    appendRouterBlock(blocksEl, title, portInfo, stage1, stage2, fullCli, proto);
-  });
-
-  document.getElementById('cliPanel').classList.remove('hidden');
-  setTimeout(() =>
-    document.getElementById('cliPanel').scrollIntoView({ behavior: 'smooth', block: 'start' }),
-    60
-  );
-}
-
-function appendRouterBlock(container, title, portInfo, stage1, stage2, fullCli, proto) {
-  const block     = document.createElement('div');
-  block.className = 'router-block';
-  block._fullCli  = fullCli;
-  block._stage1   = stage1;
-  block._stage2   = stage2;
-  block._label    = title;
-
-  const hdr     = document.createElement('div');
-  hdr.className = 'router-block-header';
-  hdr.innerHTML = `
-    <div>
-      <div class="router-block-title">▶ ${title}</div>
-      <div class="router-block-ports">${portInfo}</div>
-    </div>
-    <div class="router-block-btns">
-      <button class="cli-btn cli-btn-copy" onclick="copyStage(this,1)">⎘ Stage 1</button>
-      <button class="cli-btn cli-btn-copy" onclick="copyStage(this,2)">⎘ Stage 2</button>
-      <button class="cli-btn cli-btn-copy" onclick="copyBlock(this)">⎘ Both</button>
-    </div>`;
-  block.appendChild(hdr);
-
-  const sl1     = document.createElement('div');
-  sl1.className = 'stage-label s1';
-  sl1.textContent = '── Stage 1: Interface Configuration';
-  block.appendChild(sl1);
-  const pre1     = document.createElement('div');
-  pre1.className = 'cli-code';
-  pre1.textContent = stage1;
-  block.appendChild(pre1);
-
-  const sl2     = document.createElement('div');
-  sl2.className = 'stage-label s2';
-  sl2.textContent = `── Stage 2: ${PROTO_NAMES[proto]} Configuration`;
-  block.appendChild(sl2);
-  const pre2     = document.createElement('div');
-  pre2.className = 'cli-code';
-  pre2.textContent = stage2;
-  block.appendChild(pre2);
-
-  container.appendChild(block);
-}
-
-/* ============================================================
-   12. COPY & EXPORT FUNCTIONS
-   ============================================================ */
-
-function copyBlock(btn) {
-  const block = btn.closest('.router-block');
-  toClipboard(block._fullCli || '', btn);
-}
-
-function copyStage(btn, stage) {
-  const block = btn.closest('.router-block');
-  toClipboard(stage === 1 ? (block._stage1 || '') : (block._stage2 || ''), btn);
-}
-
-function copyAllCLI() {
-  toClipboard(getAllCLI(), null);
-  alert('All CLI copied to clipboard!');
-}
-
-function toClipboard(text, btn) {
-  navigator.clipboard.writeText(text).then(() => {
-    if (!btn) return;
-    const orig = btn.textContent;
-    btn.textContent = '✓ Done';
-    setTimeout(() => { btn.textContent = orig; }, 1500);
-  });
-}
-
-function getAllCLI() {
-  return Array.from(document.querySelectorAll('#cliBlocks .router-block'))
-    .map(b => {
-      const sep = '! ' + '-'.repeat(60);
-      return `${sep}\n! ${b._label}\n${sep}\n\n${b._fullCli}`;
-    }).join('\n');
-}
-
-function exportCLI()     { exportCLIText(); }
-
-function exportCLIText() {
-  const base = document.getElementById('base').value.trim().replace(/\./g, '_');
-  dlBlob(getAllCLI(), 'text/plain', `VLSM_CLI_${currentProto}_${base}.txt`);
-}
-
-function exportCLIExcel() {
-  const base  = document.getElementById('base').value.trim();
-  const proto = PROTO_NAMES[currentProto] || '';
-  const lines = [`${base} - VLSM CLI (${proto})`, '', ' '];
-
-  document.querySelectorAll('#cliBlocks .router-block').forEach(b => {
-    lines.push(b._label || '');
-    lines.push('--- Stage 1: Interface Configuration ---');
-    (b._stage1 || '').split('\n').forEach(l => lines.push('\t' + l));
-    lines.push('--- Stage 2: Routing Configuration ---');
-    (b._stage2 || '').split('\n').forEach(l => lines.push('\t' + l));
-    lines.push('');
-  });
-
-  dlBlob('\uFEFF' + lines.join('\n'), 'application/vnd.ms-excel;charset=utf-8',
-    `VLSM_CLI_${currentProto}_${base.replace(/\./g, '_')}.xls`);
-}
-
-/* ============================================================
-   13. EXCEL TABLE EXPORT
-   ============================================================ */
-
-function downloadExcel() {
-  const rows = document.querySelectorAll('#vlsmTable tr');
-  if (rows.length <= 1) { alert('Please calculate VLSM first.'); return; }
-
-  const base = document.getElementById('base').value.trim();
-  const topo = topoUsed === 'ring' ? 'Ring' : 'Bus/Linear';
-
-  let html = `<html xmlns:o="urn:schemas-microsoft-com:office:office"
-    xmlns:x="urn:schemas-microsoft-com:office:excel"
-    xmlns="http://www.w3.org/TR/REC-html40">
-<head><meta charset="UTF-8">
-<!--[if gte mso 9]><xml><x:ExcelWorkbook><x:ExcelWorksheets>
-<x:ExcelWorksheet><x:Name>VLSM</x:Name></x:ExcelWorksheet>
-</x:ExcelWorksheets></x:ExcelWorkbook></xml><![endif]-->
-<style>
-body{font-family:Arial;font-size:11pt;}
-.title{font-size:14pt;font-weight:bold;color:#1e3a8a;background:#dbeafe;padding:6px 14px;}
-.sub{font-size:9pt;color:#555;background:#f0f9ff;padding:4px 14px;}
-th{background:#1e40af;color:white;font-weight:bold;padding:8px 16px;border:1px solid #1d4ed8;white-space:nowrap;}
-td{padding:7px 16px;border:1px solid #d1d5db;white-space:nowrap;}
-.lan-e{background:#eff6ff;}.lan-o{background:#fff;}.wan-r{background:#fffbeb;}
-.td-net{font-weight:bold;color:#1e40af;}.td-wan{font-weight:bold;color:#b45309;}
-.td-cidr{font-weight:bold;color:#166534;}
-</style></head><body>
-<table>
-<tr><td colspan="13" class="title">${base} — VLSM Routing Table (${topo})</td></tr>
-<tr><td colspan="13" class="sub">Generated: ${new Date().toLocaleString()} · WAN: OUT=firstIP (S0/x/0) · IN=lastIP (S0/x/1)</td></tr>
-<tr><td colspan="13" style="height:4px;background:#f0f9ff;"></td></tr>`;
-
-  let lanIdx = 0;
-  rows.forEach((r, ri) => {
-    if (ri === 0) {
-      html += '<tr>';
-      r.querySelectorAll('th').forEach(c => { html += `<th>${c.innerText}</th>`; });
-      html += '</tr>'; return;
-    }
-    const isWan = r.classList.contains('row-wan');
-    const cls   = isWan ? 'wan-r' : (lanIdx % 2 === 0 ? 'lan-o' : 'lan-e');
-    if (!isWan) lanIdx++;
-    html += `<tr class="${cls}">`;
-    r.querySelectorAll('td').forEach((c, ci) => {
-      const ex = ci === 8 ? (isWan ? ' class="td-wan"' : ' class="td-net"')
-               : ci === 5 ? ' class="td-cidr"' : '';
-      html += `<td${ex}>${c.innerText}</td>`;
     });
-    html += '</tr>';
+    xml += '</row>';
   });
-
-  html += '</table></body></html>';
-  dlBlob('\uFEFF' + html, 'application/vnd.ms-excel;charset=utf-8',
-    `VLSM_Table_${base.replace(/\./g, '_')}.xls`);
+  xml += '</sheetData></worksheet>';
+  return xml;
 }
 
-/* ============================================================
-   HELPER: BLOB FILE DOWNLOAD
-   ============================================================ */
+function colName(idx) {
+  let name = ''; idx++;
+  while (idx > 0) { let rem = (idx - 1) % 26; name = String.fromCharCode(65 + rem) + name; idx = Math.floor((idx - 1) / 26); }
+  return name;
+}
 
-function dlBlob(content, type, filename) {
-  const blob = new Blob([content], { type });
+function buildWorkbook(wsXml, sheetName) {
+  return {
+    wbXml: `<?xml version="1.0" encoding="UTF-8"?><workbook xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"><sheets><sheet name="${sheetName}" sheetId="1" r:id="rId1"/></sheets></workbook>`,
+    relsXml: `<?xml version="1.0" encoding="UTF-8"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="worksheets/sheet1.xml"/><Relationship Id="rId2" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/styles" Target="styles.xml"/></Relationships>`,
+    wsXml,
+    stylesXml: `<?xml version="1.0" encoding="UTF-8" standalone="yes"?><styleSheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><fonts count="2"><font><sz val="11"/><name val="Calibri"/></font><font><b/><sz val="11"/><name val="Calibri"/></font></fonts><fills count="3"><fill><patternFill patternType="none"/></fill><fill><patternFill patternType="gray125"/></fill><fill><patternFill patternType="solid"><fgColor rgb="FF1E3A5F"/><bgColor indexed="64"/></patternFill></fill></fills><borders count="2"><border><left/><right/><top/><bottom/><diagonal/></border><border><left style="thin"><color auto="1"/></left><right style="thin"><color auto="1"/></right><top style="thin"><color auto="1"/></top><bottom style="thin"><color auto="1"/></bottom><diagonal/></border></borders><cellStyleXfs count="1"><xf numFmtId="0" fontId="0" fillId="0" borderId="0"/></cellStyleXfs><cellXfs count="3"><xf numFmtId="0" fontId="0" fillId="0" borderId="0" xfId="0"/><xf numFmtId="0" fontId="1" fillId="2" borderId="1" xfId="0" applyFont="1" applyFill="1" applyBorder="1"/><xf numFmtId="0" fontId="0" fillId="0" borderId="1" xfId="0" applyBorder="1"/></cellXfs></styleSheet>`,
+    contentXml: `<?xml version="1.0" encoding="UTF-8"?><Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"><Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/><Default Extension="xml" ContentType="application/xml"/><Override PartName="/xl/workbook.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml"/><Override PartName="/xl/worksheets/sheet1.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml"/><Override PartName="/xl/styles.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.styles+xml"/></Types>`,
+  };
+}
+
+function downloadXLSX(wb, filename) {
+  const files = {
+    '[Content_Types].xml': wb.contentXml,
+    '_rels/.rels': `<?xml version="1.0" encoding="UTF-8"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="xl/workbook.xml"/></Relationships>`,
+    'xl/workbook.xml': wb.wbXml,
+    'xl/_rels/workbook.xml.rels': wb.relsXml,
+    'xl/styles.xml': wb.stylesXml,
+    'xl/worksheets/sheet1.xml': wb.wsXml,
+  };
+  const zip  = buildZip(files);
+  const blob = new Blob([zip], { type: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet' });
   const url  = URL.createObjectURL(blob);
   const a    = document.createElement('a');
-  a.href = url; a.download = filename;
-  document.body.appendChild(a); a.click();
-  document.body.removeChild(a); URL.revokeObjectURL(url);
+  a.href = url; a.download = filename; a.click();
+  setTimeout(() => URL.revokeObjectURL(url), 1000);
 }
 
-/* ============================================================
-   14. INITIALISATION
-   ============================================================ */
+function buildZip(files) {
+  const enc = new TextEncoder();
+  let localParts = [], centralParts = [], offset = 0;
+  const crc32Table = (() => {
+    let t = new Uint32Array(256);
+    for (let i = 0; i < 256; i++) {
+      let c = i;
+      for (let j = 0; j < 8; j++) c = (c & 1) ? (0xEDB88320 ^ (c >>> 1)) : (c >>> 1);
+      t[i] = c;
+    }
+    return t;
+  })();
+  function crc32(data) { let c = 0xFFFFFFFF; for (let i = 0; i < data.length; i++) c = crc32Table[(c ^ data[i]) & 0xFF] ^ (c >>> 8); return (c ^ 0xFFFFFFFF) >>> 0; }
+  function concat(...arrays) { const tot = arrays.reduce((s, a) => s + a.length, 0); const o = new Uint8Array(tot); let p = 0; for (const a of arrays) { o.set(a, p); p += a.length; } return o; }
+  function u16(n) { return new Uint8Array([n & 0xff, (n >> 8) & 0xff]); }
+  function u32(n) { return new Uint8Array([n & 0xff, (n >> 8) & 0xff, (n >> 16) & 0xff, (n >> 24) & 0xff]); }
+  function b(...v) { return new Uint8Array(v); }
+  for (const [name, fileContent] of Object.entries(files)) {
+    const nb = enc.encode(name), db = enc.encode(fileContent);
+    const crc = crc32(db), size = db.length;
+    const lh = concat(b(0x50,0x4B,0x03,0x04),b(20,0),b(0,0),b(0,0),b(0,0,0,0),u32(crc),u32(size),u32(size),u16(nb.length),b(0,0),nb,db);
+    const ce = concat(b(0x50,0x4B,0x01,0x02),b(20,0,20,0),b(0,0),b(0,0),b(0,0,0,0),u32(crc),u32(size),u32(size),u16(nb.length),b(0,0),b(0,0),b(0,0),b(0,0),b(0,0,0,0),u32(offset),nb);
+    localParts.push(lh); centralParts.push(ce); offset += lh.length;
+  }
+  const cdSize = centralParts.reduce((s, a) => s + a.length, 0);
+  const total  = Object.keys(files).length;
+  const eocd   = concat(b(0x50,0x4B,0x05,0x06),b(0,0,0,0),u16(total),u16(total),u32(cdSize),u32(offset),b(0,0));
+  return concat(...localParts, ...centralParts, eocd);
+}
 
-window.addEventListener('DOMContentLoaded', () => {
-  const wrap   = document.getElementById('hostBoxes');
-  const addBtn = document.createElement('button');
-  addBtn.className = 'btn-add';
-  addBtn.setAttribute('aria-label', 'Add a new router');
-  addBtn.innerHTML = `
-    <svg width="12" height="12" viewBox="0 0 12 12" fill="none" aria-hidden="true">
-      <path d="M6 1v10M1 6h10" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/>
-    </svg> Add Router`;
-  addBtn.onclick = () => addHostBox();
-  wrap.appendChild(addBtn);
+// ============================================================
+//  CLI SECTION
+// ============================================================
+function unlockCLI() {
+  document.getElementById('cliLocked').classList.add('hidden');
+  document.getElementById('cliContent').classList.remove('hidden');
+  refreshRouterGrid();
+  refreshSerialSection();
+}
 
-  // Default example routers
-  [25000, 15000, 10000, 500].forEach(v => addHostBox(v));
-  selectTopo('bus');
-});
+function lockCLI() {
+  document.getElementById('cliLocked').classList.remove('hidden');
+  document.getElementById('cliContent').classList.add('hidden');
+  document.getElementById('cliOutputSection').classList.add('hidden');
+  routers = []; serialLinks = []; routerCount = 0;
+}
 
-// Ctrl+Enter keyboard shortcut
-document.addEventListener('keydown', e => {
-  if (e.key === 'Enter' && e.ctrlKey) calculate();
+function setTopo(t) {
+  topo = t;
+  document.getElementById('topoRing').classList.toggle('active', t === 'ring');
+  document.getElementById('topoBus').classList.toggle('active', t === 'bus');
+  refreshSerialSection();
+}
+
+function setProto(p) {
+  proto = p;
+  document.querySelectorAll('[data-proto]').forEach(b => b.classList.toggle('active', b.dataset.proto === p));
+  document.getElementById('eigrpAsField').classList.toggle('hidden', p !== 'eigrp');
+  document.getElementById('ospfPidField').classList.toggle('hidden', p !== 'ospf');
+}
+
+function addRouter() {
+  routerCount++;
+  routers.push({ id: routerCount, name: 'R' + routerCount, lans: [] });
+  refreshRouterGrid();
+  refreshSerialSection();
+}
+
+function removeLastRouter() {
+  if (routers.length === 0) return;
+  routers.pop();
+  refreshRouterGrid();
+  refreshSerialSection();
+}
+
+function refreshRouterGrid() {
+  const grid = document.getElementById('routerAssignGrid');
+  grid.innerHTML = '';
+  routers.forEach((r, ri) => {
+    const div = document.createElement('div');
+    div.className = 'router-card';
+    const checks = subnetData.map((s, si) =>
+      `<label class="net-check">
+        <input type="checkbox" ${r.lans.includes(si) ? 'checked' : ''} onchange="toggleLan(${ri},${si},this.checked)">
+        <span>Net ${s.no}: ${s.networkId}${s.cidr}</span>
+      </label>`
+    ).join('');
+    div.innerHTML = `
+      <div class="router-card-title">
+        <span class="router-icon">⬡</span> ${r.name}
+      </div>
+      <div class="net-check-list">${checks}</div>`;
+    grid.appendChild(div);
+  });
+}
+
+function toggleLan(ri, si, checked) {
+  if (checked) { if (!routers[ri].lans.includes(si)) routers[ri].lans.push(si); }
+  else routers[ri].lans = routers[ri].lans.filter(x => x !== si);
+}
+
+function buildNetOpts(link) {
+  const subOpts = subnetData.map((s, si) =>
+    `<option value="${si}" ${link.netIndex === si ? 'selected' : ''}>Net ${s.no}: ${s.networkId}${s.cidr}</option>`
+  ).join('');
+  const clsOpts = classANets.map((n, ci) =>
+    `<option value="a:${ci}" ${link.classAIndex === ci ? 'selected' : ''}>${n.networkId}${n.cidr}</option>`
+  ).join('');
+  return `${subOpts}<optgroup label="── Class A Networks ──">${clsOpts}</optgroup>`;
+}
+
+function refreshSerialSection() {
+  const hint   = document.getElementById('serialHint');
+  const list   = document.getElementById('serialList');
+  list.innerHTML = '';
+
+  if (routers.length < 2) {
+    hint.textContent = (topo === 'ring' ? 'Ring' : 'Bus') + ' topology: add at least 2 routers to auto-generate serial links.';
+    serialLinks = [];
+    return;
+  }
+
+  const prevAssignments = {};
+  serialLinks.forEach(link => { prevAssignments[link.r1 + '_' + link.r2] = { netIndex: link.netIndex, classAIndex: link.classAIndex }; });
+  serialLinks = [];
+
+  const n = routers.length;
+  if (topo === 'ring') {
+    hint.textContent = 'Ring topology: ' + n + ' routers → ' + n + ' serial links (R1↔R2 ... R' + n + '↔R1)';
+    for (let i = 0; i < n; i++) {
+      const r1 = i, r2 = (i + 1) % n;
+      const prev = prevAssignments[r1 + '_' + r2] || { netIndex: -1, classAIndex: -1 };
+      serialLinks.push({ r1, r2, netIndex: prev.netIndex, classAIndex: prev.classAIndex });
+    }
+  } else {
+    hint.textContent = 'Bus topology: ' + n + ' routers → ' + (n - 1) + ' serial links (R1→R2 ... R' + (n-1) + '→R' + n + ')';
+    for (let i = 0; i < n - 1; i++) {
+      const r1 = i, r2 = i + 1;
+      const prev = prevAssignments[r1 + '_' + r2] || { netIndex: -1, classAIndex: -1 };
+      serialLinks.push({ r1, r2, netIndex: prev.netIndex, classAIndex: prev.classAIndex });
+    }
+  }
+
+  serialLinks.forEach((link, li) => {
+    const div = document.createElement('div');
+    div.className = 'serial-entry';
+    div.innerHTML = `
+      <span class="serial-label">${routers[link.r1].name} ↔ ${routers[link.r2].name}</span>
+      <span class="serial-arrow">→</span>
+      <select onchange="setSerialNet(${li}, this.value)">
+        <option value="-1">-- Select Network --</option>
+        ${buildNetOpts(link)}
+      </select>`;
+    list.appendChild(div);
+  });
+}
+
+function setSerialNet(li, val) {
+  if (val.startsWith('a:')) {
+    serialLinks[li].netIndex = -1;
+    serialLinks[li].classAIndex = parseInt(val.slice(2));
+  } else {
+    serialLinks[li].classAIndex = -1;
+    serialLinks[li].netIndex = parseInt(val);
+  }
+}
+
+function resetCLI() {
+  routers = []; serialLinks = []; routerCount = 0;
+  proto = 'static'; topo = 'ring';
+  document.querySelectorAll('[data-proto]').forEach(b => b.classList.toggle('active', b.dataset.proto === 'static'));
+  document.getElementById('topoRing').classList.add('active');
+  document.getElementById('topoBus').classList.remove('active');
+  ['eigrpAsField','ospfPidField'].forEach(id => document.getElementById(id).classList.add('hidden'));
+  document.getElementById('cliOutputSection').classList.add('hidden');
+  refreshRouterGrid();
+  refreshSerialSection();
+}
+
+// ============================================================
+//  CLI GENERATION — VERIFIED WORKING PROTOCOLS
+// ============================================================
+function generateCLI() {
+  const errEl = document.getElementById('cliError');
+  errEl.textContent = '';
+  if (routers.length === 0) { errEl.textContent = '⚠ Add at least one router.'; return; }
+  for (const link of serialLinks) {
+    if (link.netIndex === -1 && link.classAIndex === -1) {
+      errEl.textContent = '⚠ Assign a network to every serial link.'; return;
+    }
+  }
+
+  const eigrpAs = parseInt(document.getElementById('eigrpAs').value) || 100;
+  const ospfPid = parseInt(document.getElementById('ospfPid').value) || 1;
+  const outputsDiv = document.getElementById('cliOutputs');
+  outputsDiv.innerHTML = '';
+
+  // Build adjacency graph for BFS static routing
+  function buildGraph() {
+    const graph = routers.map(() => []);
+    serialLinks.forEach((link, li) => {
+      if (link.r1 !== -1 && link.r2 !== -1) {
+        graph[link.r1].push({ neighbor: link.r2, linkIdx: li });
+        graph[link.r2].push({ neighbor: link.r1, linkIdx: li });
+      }
+    });
+    return graph;
+  }
+
+  // BFS: first hop link index from src toward dst
+  function firstHopLink(graph, src, dst) {
+    if (src === dst) return null;
+    const visited = new Array(routers.length).fill(false);
+    const queue   = [[src, null]];
+    visited[src]  = true;
+    while (queue.length) {
+      const [cur, fhl] = queue.shift();
+      for (const { neighbor, linkIdx } of graph[cur]) {
+        if (visited[neighbor]) continue;
+        visited[neighbor] = true;
+        const resolved = fhl !== null ? fhl : linkIdx;
+        if (neighbor === dst) return resolved;
+        queue.push([neighbor, resolved]);
+      }
+    }
+    return null;
+  }
+
+  // Get all subnet indices (LAN + serial) connected to a router
+  function getRouterNets(ri) {
+    const nets = new Set(routers[ri].lans);
+    serialLinks.forEach(link => {
+      if ((link.r1 === ri || link.r2 === ri) && link.netIndex !== -1) nets.add(link.netIndex);
+    });
+    return [...nets];
+  }
+
+  const topoGraph = buildGraph();
+
+  routers.forEach((router, ri) => {
+    // ── Stage 1: Interface Configuration ──────────────────
+    let ipCli = `enable\nconfigure terminal\nhostname ${router.name}\n!\n`;
+
+    // LAN interfaces — FastEthernet0/0, FastEthernet0/1 max
+    router.lans.forEach((si, idx) => {
+      if (idx > 1) return;
+      const s = subnetData[si];
+      ipCli += `interface FastEthernet0/${idx}\n`;
+      ipCli += ` ip address ${s.first} ${s.mask}\n`;
+      ipCli += ` no shutdown\n!\n`;
+    });
+
+    // Serial interfaces
+    let serialPortIdx = 0;
+    serialLinks.forEach((link, li) => {
+      if (link.r1 !== ri && link.r2 !== ri) return;
+      const s      = getSerialNet(link);
+      const iface  = `Serial0/1/${serialPortIdx++}`;
+      const isDCE  = link.r1 === ri;
+      const myIp   = isDCE ? s.first : s.second;
+      ipCli += `interface ${iface}\n`;
+      ipCli += ` ip address ${myIp} ${s.mask}\n`;
+      if (isDCE) ipCli += ` clock rate 64000\n`;
+      ipCli += ` no shutdown\n!\n`;
+    });
+    ipCli += `end\n`;
+
+    // ── Stage 2: Routing Protocol ──────────────────────────
+    let routeCli = '';
+
+    if (proto === 'static') {
+      // ── STATIC — working, kept as-is ──────────────────
+      routeCli = `enable\nconfigure terminal\n!\n! Static routing for ${router.name}\n!\n`;
+      const myNets = new Set();
+      router.lans.forEach(si => myNets.add(si));
+      serialLinks.forEach(link => {
+        if ((link.r1 === ri || link.r2 === ri) && link.netIndex !== -1) myNets.add(link.netIndex);
+      });
+
+      subnetData.forEach((s, si) => {
+        if (myNets.has(si)) return; // skip directly connected
+        // Find owner router of this subnet
+        let ownerRouter = -1;
+        for (let r = 0; r < routers.length; r++) {
+          if (r === ri) continue;
+          if (routers[r].lans.includes(si)) { ownerRouter = r; break; }
+          if (serialLinks.some(l => (l.r1 === r || l.r2 === r) && l.netIndex === si)) { ownerRouter = r; break; }
+        }
+        if (ownerRouter === -1) return;
+        const li = firstHopLink(topoGraph, ri, ownerRouter);
+        if (li === null) return;
+        const link    = serialLinks[li];
+        const linkNet = getSerialNet(link);
+        const gateway = link.r1 === ri ? linkNet.second : linkNet.first;
+        routeCli += `ip route ${s.networkId} ${s.mask} ${gateway}\n`;
+      });
+      routeCli += `end\n`;
+
+    } else if (proto === 'rip') {
+      // ── RIP v2 ────────────────────────────────────────
+      // Uses subnet networkId (correct with no auto-summary in RIP v2)
+      // Advertises exact subnets — works in Packet Tracer
+      routeCli = `enable\nconfigure terminal\n!\nrouter rip\n version 2\n no auto-summary\n`;
+      getRouterNets(ri).forEach(si => {
+        routeCli += ` network ${subnetData[si].networkId}\n`;
+      });
+      routeCli += `!\nend\n`;
+
+    } else if (proto === 'eigrp') {
+      // ── EIGRP — FIXED: added wildcard masks ───────────
+      // Without wildcard, EIGRP uses classful matching which
+      // can activate on unintended interfaces.
+      // With wildcard masks, only the exact subnet is matched.
+      routeCli = `enable\nconfigure terminal\n!\nrouter eigrp ${eigrpAs}\n no auto-summary\n`;
+      getRouterNets(ri).forEach(si => {
+        const s = subnetData[si];
+        const wc = intToIp(wildcardMask(s.maskInt));
+        routeCli += ` network ${s.networkId} ${wc}\n`;
+      });
+      routeCli += `!\nend\n`;
+
+    } else if (proto === 'ospf') {
+      // ── OSPF — correct, kept as-is ────────────────────
+      // Uses wildcard mask and area 0 — correct Cisco IOS syntax
+      routeCli = `enable\nconfigure terminal\n!\nrouter ospf ${ospfPid}\n`;
+      getRouterNets(ri).forEach(si => {
+        const s  = subnetData[si];
+        const wc = intToIp(wildcardMask(s.maskInt));
+        routeCli += ` network ${s.networkId} ${wc} area 0\n`;
+      });
+      routeCli += `!\nend\n`;
+    }
+
+    // ── Render router block ────────────────────────────
+    const block = document.createElement('div');
+    block.className = 'router-output';
+    block.innerHTML = `
+      <div class="router-output-header">
+        <span class="router-output-icon">⬡</span>
+        <span>${router.name} Configuration</span>
+      </div>
+      <div class="tab-bar">
+        <button class="tab-btn active" onclick="switchTab(this,'ip-${ri}')">
+          Stage 1: Interfaces
+        </button>
+        <button class="tab-btn" onclick="switchTab(this,'route-${ri}')">
+          Stage 2: Routing
+        </button>
+      </div>
+      <div id="ip-${ri}" class="tab-content active">
+        <div class="code-block" id="code-ip-${ri}">
+          <button class="copy-btn" onclick="copyCode('code-ip-${ri}',this)">COPY</button>${escHtml(ipCli)}
+        </div>
+      </div>
+      <div id="route-${ri}" class="tab-content">
+        <div class="code-block" id="code-route-${ri}">
+          <button class="copy-btn" onclick="copyCode('code-route-${ri}',this)">COPY</button>${escHtml(routeCli)}
+        </div>
+      </div>`;
+    outputsDiv.appendChild(block);
+  });
+
+  document.getElementById('cliOutputSection').classList.remove('hidden');
+  document.getElementById('cliOutputSection').scrollIntoView({ behavior: 'smooth', block: 'start' });
+}
+
+// ============================================================
+//  UTILITIES
+// ============================================================
+function switchTab(btn, tabId) {
+  const parent = btn.closest('.router-output');
+  parent.querySelectorAll('.tab-btn').forEach(b => b.classList.remove('active'));
+  parent.querySelectorAll('.tab-content').forEach(c => c.classList.remove('active'));
+  btn.classList.add('active');
+  document.getElementById(tabId).classList.add('active');
+}
+
+function copyCode(id, btn) {
+  const el   = document.getElementById(id);
+  const text = el.innerText.replace(/^COPY\n?/, '').replace(/^COPIED!\n?/, '');
+  navigator.clipboard.writeText(text).then(() => {
+    btn.textContent = 'COPIED!';
+    btn.classList.add('copied');
+    setTimeout(() => { btn.textContent = 'COPY'; btn.classList.remove('copied'); }, 2000);
+  });
+}
+
+function escHtml(s) {
+  return s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+}
+
+// ============================================================
+//  INIT
+// ============================================================
+document.addEventListener('DOMContentLoaded', () => {
+  buildCheatSheet();
+  loadDefaultData();
+  setMode('vlsm');
+  setProto('static');
 });

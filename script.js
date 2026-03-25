@@ -762,9 +762,9 @@ function generateCLI() {
       // ── RIP v2 ────────────────────────────────────────
       // Uses subnet networkId (correct with no auto-summary in RIP v2)
       // Advertises exact subnets — works in Packet Tracer
-      routeCli = `\nenable\nconfigure terminal\n!\nrouter rip\n version 2\n no auto-summary\n`;
+      routeCli = `\nenable\nconfigure terminal\n!\nrouter rip\nversion 2\nno auto-summary\n`;
       getRouterNets(ri).forEach(si => {
-        routeCli += ` network ${subnetData[si].networkId}\n`;
+        routeCli += `network ${subnetData[si].networkId}\n`;
       });
       routeCli += `!\nend\n`;
 

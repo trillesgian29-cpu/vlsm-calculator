@@ -466,6 +466,35 @@ function addRouter() {
   routers.push({ id: routerCount, name: 'R' + routerCount, lans: [] });
   refreshRouterGrid();
   refreshSerialSection();
+
+  // Update badge
+  const b = document.getElementById('routerCountBadge');
+  if (b) b.textContent = routers.length + ' Router' + (routers.length !== 1 ? 's' : '');
+}
+
+function refreshRouterGrid() {
+  const grid = document.getElementById('routerAssignGrid');
+  grid.innerHTML = '';
+  routers.forEach((r, ri) => {
+    const div = document.createElement('div');
+    div.className = 'router-card';
+    const checks = subnetData.map((s, si) =>
+      `<label class="net-check">
+        <input type="checkbox" ${r.lans.includes(si) ? 'checked' : ''}
+               onchange="toggleLan(${ri},${si},this.checked)">
+        <span>
+          <span style="color:var(--blue-h);font-weight:700;">${s.networkId}${s.cidr}</span>
+          <span style="color:var(--text3);font-size:10px;"> · ${s.hosts} hosts</span>
+        </span>
+      </label>`
+    ).join('');
+    div.innerHTML = `
+      <div class="router-card-title">
+        <span class="router-icon">⬡</span> ${r.name}
+      </div>
+      <div class="net-check-list">${checks}</div>`;
+    grid.appendChild(div);
+  });
 }
 
 function removeLastRouter() {
@@ -628,7 +657,8 @@ function generateCLI() {
     return null;
   }
 
-  // Get all subnet indices (LAN + serial) connected to a router
+  // getRouterNets — returns subnetData indices (LAN + subnetData serial links)
+  // NOTE: does NOT include Class A serial networks (classAIndex)
   function getRouterNets(ri) {
     const nets = new Set(routers[ri].lans);
     serialLinks.forEach(link => {
@@ -637,19 +667,49 @@ function generateCLI() {
     return [...nets];
   }
 
+  // getAllRouterNets — returns ALL network objects for a router:
+  //   LAN subnets (from subnetData)
+  // + serial links from subnetData (netIndex)
+  // + serial links from classANets  (classAIndex)
+  // Used by OSPF and EIGRP which must advertise every interface network.
+  function getAllRouterNetObjs(ri) {
+    const objs = [];
+    const seen = new Set();
+
+    // LAN subnets
+    routers[ri].lans.forEach(si => {
+      if (!seen.has('s' + si)) { seen.add('s' + si); objs.push(subnetData[si]); }
+    });
+
+    // Serial links — both subnetData and classANets
+    serialLinks.forEach(link => {
+      if (link.r1 !== ri && link.r2 !== ri) return;
+      if (link.netIndex !== -1) {
+        const key = 's' + link.netIndex;
+        if (!seen.has(key)) { seen.add(key); objs.push(subnetData[link.netIndex]); }
+      }
+      if (link.classAIndex !== -1) {
+        const key = 'a' + link.classAIndex;
+        if (!seen.has(key)) { seen.add(key); objs.push(classANets[link.classAIndex]); }
+      }
+    });
+
+    return objs;
+  }
+
   const topoGraph = buildGraph();
 
   routers.forEach((router, ri) => {
     // ── Stage 1: Interface Configuration ──────────────────
-    let ipCli = `enable\nconfigure terminal\nhostname ${router.name}\n!\n`;
+    let ipCli = `\nenable\nconfigure terminal\nhostname ${router.name}\n!\n`;
 
     // LAN interfaces — FastEthernet0/0, FastEthernet0/1 max
     router.lans.forEach((si, idx) => {
       if (idx > 1) return;
       const s = subnetData[si];
       ipCli += `interface FastEthernet0/${idx}\n`;
-      ipCli += ` ip address ${s.first} ${s.mask}\n`;
-      ipCli += ` no shutdown\n!\n`;
+      ipCli += `ip address ${s.first} ${s.mask}\n`;
+      ipCli += `no shutdown\n!\n`;
     });
 
     // Serial interfaces
@@ -661,9 +721,9 @@ function generateCLI() {
       const isDCE  = link.r1 === ri;
       const myIp   = isDCE ? s.first : s.second;
       ipCli += `interface ${iface}\n`;
-      ipCli += ` ip address ${myIp} ${s.mask}\n`;
-      if (isDCE) ipCli += ` clock rate 64000\n`;
-      ipCli += ` no shutdown\n!\n`;
+      ipCli += `ip address ${myIp} ${s.mask}\n`;
+      if (isDCE) ipCli += `clock rate 64000\n`;
+      ipCli += `no shutdown\n!\n`;
     });
     ipCli += `end\n`;
 
@@ -709,26 +769,33 @@ function generateCLI() {
       routeCli += `!\nend\n`;
 
     } else if (proto === 'eigrp') {
-      // ── EIGRP — FIXED: added wildcard masks ───────────
-      // Without wildcard, EIGRP uses classful matching which
-      // can activate on unintended interfaces.
-      // With wildcard masks, only the exact subnet is matched.
-      routeCli = `enable\nconfigure terminal\n!\nrouter eigrp ${eigrpAs}\n no auto-summary\n`;
-      getRouterNets(ri).forEach(si => {
-        const s = subnetData[si];
+      // ── EIGRP ─────────────────────────────────────────
+      // Advertises LAN networks + BOTH serial link networks
+      // per router (subnetData serials and Class A serials).
+      // Wildcard masks used for exact interface matching.
+      // no auto-summary required for VLSM to work correctly.
+      routeCli = `\nenable\nconfigure terminal\n!\n`;
+      routeCli += `!EIGRP AS ${eigrpAs} — must match on ALL routers\n`;
+      routeCli += `router eigrp ${eigrpAs}\n`;
+      routeCli += `no auto-summary\n`;
+      getAllRouterNetObjs(ri).forEach(s => {
         const wc = intToIp(wildcardMask(s.maskInt));
-        routeCli += ` network ${s.networkId} ${wc}\n`;
+        routeCli += `\nnetwork ${s.networkId} ${wc}\n`;
       });
       routeCli += `!\nend\n`;
 
     } else if (proto === 'ospf') {
-      // ── OSPF — correct, kept as-is ────────────────────
-      // Uses wildcard mask and area 0 — correct Cisco IOS syntax
-      routeCli = `enable\nconfigure terminal\n!\nrouter ospf ${ospfPid}\n`;
-      getRouterNets(ri).forEach(si => {
-        const s  = subnetData[si];
+      // ── OSPF ──────────────────────────────────────────
+      // Advertises LAN networks + BOTH serial link networks
+      // per router (subnetData serials and Class A serials).
+      // Wildcard masks + area 0 — correct Cisco IOS syntax.
+      // Process ID is locally significant (need not match).
+      routeCli = `\nenable\nconfigure terminal\n!\n`;
+      routeCli += `!OSPF Process ID ${ospfPid} — locally significant\n`;
+      routeCli += `router ospf ${ospfPid}\n`;
+      getAllRouterNetObjs(ri).forEach(s => {
         const wc = intToIp(wildcardMask(s.maskInt));
-        routeCli += ` network ${s.networkId} ${wc} area 0\n`;
+        routeCli += `\nnetwork ${s.networkId} ${wc} area 0\n`;
       });
       routeCli += `!\nend\n`;
     }
@@ -800,4 +867,3 @@ document.addEventListener('DOMContentLoaded', () => {
   setMode('vlsm');
   setProto('static');
 });
-
